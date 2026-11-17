@@ -68,13 +68,28 @@ static void sys_initialize_tls(ppu_context* ctx)
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
  * and every frontend animation timed off it crawled. */
-static void sys_time_get_system_time(ppu_context* ctx)
+/* The guest system clock in microseconds, shared with the HLE libraries that
+ * hand the guest timestamps it compares against this clock (cellAudio's port
+ * timestamps). Two copies of "now" on different bases is how FMOD came to
+ * schedule its mixer off a value ~machine-uptime away from the real one. */
+extern "C" uint64_t ps3_guest_system_time_us(void)
 {
 #ifdef _WIN32
     static LARGE_INTEGER s_freq, s_base;
     if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
+    const uint64_t d = (uint64_t)(now.QuadPart - s_base.QuadPart), q = (uint64_t)s_freq.QuadPart;
+    return (d / q) * 1000000ull + (d % q) * 1000000ull / q;
+#else
+    return host_monotonic_ns() / 1000ull;
+#endif
+}
+
+static void sys_time_get_system_time(ppu_context* ctx)
+{
+#ifdef _WIN32
+    ctx->gpr[3] = ps3_guest_system_time_us();
+    return;
 #else
     /* The same host clock as the timebase (sys_timer.h), so guest code that
      * mixes mftb and this stays consistent. */
@@ -255,6 +270,18 @@ static void lwm_release(struct LwmSlot* sl)
 volatile int g_nd_inpump = 0;
 /* syscalls/sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). */
 extern "C" void ppu_thread_note_block(uint64_t tid);
+/* MM_LWM_DBG=<hexEA>: log recursive lock/unlock traffic on one lwmutex. */
+static void mm_lwm_dbg(const char* what, ppu_context* ctx, uint32_t lwm, uint32_t rc)
+{
+    static int init = 0; static uint32_t w = 0; static long n = 0;
+    if (!init) { const char* e = getenv("MM_LWM_DBG"); w = e ? (uint32_t)strtoul(e, 0, 16) : 0; init = 1; }
+    if (!w || lwm != w) return;
+    if (rc < 3 || rc > 40) return;
+    if (++n > 400) return;
+    { const uint32_t sp = (uint32_t)ctx->gpr[1];
+      fprintf(stderr, "[mm-lwm] %s tid=%llu lwm=0x%08X recur=%u lr=0x%08X caller=0x%08X sz=0x%X\n", what,
+            (unsigned long long)ctx->thread_id, lwm, rc, (uint32_t)ctx->lr, vm_read32(sp + 0xC4), (uint32_t)ctx->gpr[25]); }
+}
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -271,6 +298,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
          * Only the holder ever stamps owner=self, so this check is race-free. */
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
             vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            mm_lwm_dbg("lock-rec", ctx, lwm, vm_read32(lwm + LWM_RECUR));
             ctx->gpr[3] = 0;
             return;
         }
@@ -286,6 +314,30 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
+            if (lwm == 0x10320010u || lwm == 0x017B1518u) {   /* MM: who blocks on the malloc locks */
+                static long _sn = 0, _sb = 0;
+                if (lwm == 0x017B1518u ? (_sb++ < 40) : ((ctx->thread_id == 1 || ctx->thread_id >= 20) && _sn++ < 400)) {
+                    uint32_t sp = (uint32_t)ctx->gpr[1];
+                    char b[900]; int p = snprintf(b, sizeof b, "[mm-lwmblk] tid=%llu lwm=0x%08X owner=%u lr=0x%08X stack:",
+                        (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), (uint32_t)ctx->lr);
+                    uint32_t prev = 0; int found = 0;
+                    for (uint32_t a = sp; a < sp + 0x1000 && found < 24 && p < 860; a += 4) {
+                        uint32_t v = vm_read32(a);
+                        if (v >= 0x00010000u && v < 0x01400000u && v != prev) { p += snprintf(b + p, sizeof b - p, " %08X", v); prev = v; found++; }
+                    }
+                    fprintf(stderr, "%s\n", b);
+                    if (lwm == 0x017B1518u) {   /* UTF-16 / ASCII text on the stack (log message being built) */
+                        char t[1200]; int q = 0;
+                        for (uint32_t a = sp; a < sp + 0x1000 && q < 1150; a += 2) {
+                            uint16_t c = (uint16_t)((vm_read32(a & ~3u) >> ((a & 2) ? 0 : 16)) & 0xFFFF);
+                            uint8_t lo = (uint8_t)c;
+                            if ((c >> 8) == 0 && lo >= 0x20 && lo < 0x7F) t[q++] = (char)lo;
+                            else if (q && t[q-1] != '|') t[q++] = '|';
+                        }
+                        t[q] = 0; fprintf(stderr, "[mm-lwmblk] text: %s\n", t);
+                    }
+                }
+            }
             ppu_thread_note_block(ctx->thread_id);
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             if (!lwm_acquire(sl0, timeout_us)) {   /* honor the timeout: ETIMEDOUT, no acquire */
@@ -314,7 +366,7 @@ static int sys_lwmutex_lock_fast(ppu_context* ctx)
     if (!sl || lwm_trace()) return 0;
     const uint32_t self = LWM_SELF(ctx);
     if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0)
-        vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+        { vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1); mm_lwm_dbg("lock-rec-fast", ctx, lwm, vm_read32(lwm + LWM_RECUR)); }
     else if (lwm_try(sl)) {
         vm_write32(lwm + LWM_OWNER, self);
         vm_write32(lwm + LWM_RECUR, 1);
@@ -338,6 +390,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
     if (sl0) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
             vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            mm_lwm_dbg("lock-rec", ctx, lwm, vm_read32(lwm + LWM_RECUR));
             ctx->gpr[3] = 0;
             return;
         }
@@ -355,6 +408,11 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t rc = vm_read32(lwm + LWM_RECUR);
+    mm_lwm_dbg("unlock", ctx, lwm, rc);
+    { static long _wn = 0; const uint32_t _lr = (uint32_t)ctx->lr;
+      if ((_lr == 0x00543070u || _lr == 0x00542D44u || _lr == 0x00543124u) && lwm != 0x10320010u && _wn++ < 40)
+        fprintf(stderr, "[mm-lwm] WRONG-UNLOCK tid=%llu lwm=0x%08X lr=0x%08X owner=%u recur=%u\n",
+                (unsigned long long)ctx->thread_id, lwm, _lr, vm_read32(lwm + LWM_OWNER), rc); }
     if (rc > 1) {                       /* recursive hold: count down, keep the lock */
         vm_write32(lwm + LWM_RECUR, rc - 1);
         ctx->gpr[3] = 0;

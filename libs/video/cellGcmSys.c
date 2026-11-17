@@ -165,6 +165,60 @@ static void gcm_set_current_display_buffer(u32 bufferId)
         rsx_draw_engine_note_flip(bufferId);
 }
 
+/* MM_FLIP_UCMD=1: present at the drain position of the frame's end instead of
+ * at PPU time. UE3 issues SetPrepareFlip(id) and then a user command (0xEB00)
+ * into the FIFO; the walker reaching that user command is the moment the RSX
+ * finishes the frame. Counting the flip at PPU time (the default) made the
+ * frame clock present whatever the drain had reached -- half-drawn menus. */
+static int  s_mm_ucmd_mode = -1;
+/* Prepared flips not yet reached by the drain, oldest first. A single slot was
+ * not enough: while loading, the PPU prepares frame N+1 before the walker has
+ * reached frame N's user command, and the second SetPrepareFlip fell back to
+ * presenting at PPU time -- showing whatever half-drawn batch the drain had
+ * reached (the white/black "tear" frames entering chapter select and loading).
+ * SPSC ring: SetPrepareFlip (PPU) pushes, the FIFO walker pops. */
+#define MM_PREP_Q 8u
+static volatile int s_mm_prep_q[MM_PREP_Q];
+static volatile u32 s_mm_prep_head = 0, s_mm_prep_tail = 0;   /* push at head, pop at tail */
+static int  s_mm_ucmd_stop = 0;          /* walker: stop this drain after the command */
+static int mm_prep_push(int id)
+{
+    const u32 h = __atomic_load_n(&s_mm_prep_head, __ATOMIC_RELAXED);
+    const u32 t = __atomic_load_n(&s_mm_prep_tail, __ATOMIC_ACQUIRE);
+    if (h - t >= MM_PREP_Q) return 0;
+    s_mm_prep_q[h % MM_PREP_Q] = id;
+    __atomic_store_n(&s_mm_prep_head, h + 1u, __ATOMIC_RELEASE);
+    { static u32 maxd = 1; const u32 d = h + 1u - t;
+      if (d > maxd) { maxd = d; printf("[MMFLIP] prepared-flip queue depth %u\n", d); } }
+    return 1;
+}
+static int mm_prep_pop(void)
+{
+    const u32 t = __atomic_load_n(&s_mm_prep_tail, __ATOMIC_RELAXED);
+    const u32 h = __atomic_load_n(&s_mm_prep_head, __ATOMIC_ACQUIRE);
+    if (t == h) return -1;
+    const int id = s_mm_prep_q[t % MM_PREP_Q];
+    __atomic_store_n(&s_mm_prep_tail, t + 1u, __ATOMIC_RELEASE);
+    return id;
+}
+static int mm_ucmd_on(void)
+{
+    /* Default ON since 2026-11-15 (verified: menus stop flashing).
+     * MM_FLIP_UCMD=0 restores the old present-at-PPU-time behaviour. */
+    if (s_mm_ucmd_mode < 0) { const char* e = getenv("MM_FLIP_UCMD"); s_mm_ucmd_mode = (e && e[0] == '0') ? 0 : 1; }
+    return s_mm_ucmd_mode;
+}
+static void mm_ucmd_flip(void)
+{
+    if (!mm_ucmd_on()) return;
+    const int id = mm_prep_pop();
+    if (id < 0) return;
+    gcm_set_current_display_buffer((u32)id);
+    s_flip_request_count++;
+    s_flip_pending = 1;
+    s_mm_ucmd_stop = 1;
+}
+
 
 /* The two JUMP encodings of the RSX FIFO: the old 0x20000000 | offset, and the new offset | 1 (the low two bits are 01
  * and the top three are 000, so the offset is the whole word with those bits cleared). Returns 1 and the target for
@@ -1650,6 +1704,48 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
+    /* NV0039 memory-to-memory copy (libgcm subchannel 1; route it here with
+     * GCM_SUBCH1_2D=1). UE3 moves textures around VRAM with these (its texture
+     * defragmenter); unimplemented, every moved texture sampled the previous
+     * occupant of its new address -- garbled fonts/HUD/menus. Trigger is
+     * BUFFER_NOTIFY (0x0328). FORMAT (0x0324) = (out_inc << 8) | in_inc. */
+    if (subch == 1) {
+        static struct { u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, len, count, fmt; } m;
+        switch (method) {
+        case 0x0184: m.dma_in    = data; return;
+        case 0x0188: m.dma_out   = data; return;
+        case 0x030C: m.off_in    = data; return;
+        case 0x0310: m.off_out   = data; return;
+        case 0x0314: m.pitch_in  = data; return;
+        case 0x0318: m.pitch_out = data; return;
+        case 0x031C: m.len       = data; return;
+        case 0x0320: m.count     = data; return;
+        case 0x0324: m.fmt       = data; return;
+        case 0x0328: {
+            extern u8* vm_base;
+            static int on = -1, dbg = -1;
+            if (on < 0) { const char* e = getenv("MM_NV0039"); on = !(e && e[0] == '0'); }
+            if (dbg < 0) { const char* e = getenv("MM_NV0039_DBG"); dbg = e ? atoi(e) : 0; }
+            if (!on || !vm_base || !m.len || !m.count) return;
+            const int lin = (m.dma_in  != 0xFEED0001u), lout = (m.dma_out != 0xFEED0001u);
+            const u32 src = cellGcmResolveLocated(lin, m.off_in);
+            const u32 dst = cellGcmResolveLocated(lout, m.off_out);
+            const u32 pin  = m.count > 1 ? m.pitch_in  : 0;
+            const u32 pout = m.count > 1 ? m.pitch_out : 0;
+            if ((u64)m.len * m.count > 0x4000000ull) return;   /* sanity: 64 MB */
+            for (u32 l = 0; l < m.count; l++)
+                memmove(vm_base + dst + (u64)l * pout, vm_base + src + (u64)l * pin, m.len);
+            { static u64 n = 0, bytes = 0; n++; bytes += (u64)m.len * m.count;
+              if (dbg && n <= (u64)dbg)
+                  printf("[NV0039] #%llu 0x%08X -> 0x%08X len=%u x%u pitch %u/%u fmt=0x%X\n",
+                         (unsigned long long)n, src, dst, m.len, m.count, m.pitch_in, m.pitch_out, m.fmt);
+              if ((n & (n - 1)) == 0 && n >= 64)
+                  printf("[NV0039] %llu copies, %llu KB total\n",
+                         (unsigned long long)n, (unsigned long long)(bytes >> 10)); }
+            return; }
+        }
+        return;
+    }
     /* NV0039 / NV309E: not implemented yet -- log first sightings. */
     /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
      * only that SOMETHING was unhandled, not enough to implement it. */
@@ -1770,8 +1866,18 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+
+/* MM_WATCH=<hexEA>: report any write path covering EA..EA+0x20 (memory-corruption hunt). */
+static int mm_watch_hits(unsigned ea, unsigned long long size)
+{
+    static int init = 0; static unsigned w = 0;
+    if (!init) { const char* e = getenv("MM_WATCH"); w = e ? (unsigned)strtoul(e, 0, 16) : 0; init = 1; }
+    return w && (unsigned long long)ea < (unsigned long long)w + 0x20u && (unsigned long long)ea + size > w;
+}
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    if (mm_watch_hits(ea, size)) fprintf(stderr, "[mm-watch] SPU PUT ea=0x%08X size=0x%X\n", ea, size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -1840,10 +1946,27 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * every one twice. */
     u32 from = (*getoff <= land) ? *getoff : s_last_ring_off;
     if (from < land) {
-        unsigned rescued = 0;
+        unsigned rescued = 0, ucmds = 0;
         for (u32 io = from; io + 8 <= land; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
             u32 w = vm_read32(ea);
+            /* UE3's flip user command (0xEB00/0xEB04, one data word): each one
+             * retires a prepared flip. Skipping it left that flip queued for
+             * ever, so the shown frame drifted further behind every resync. */
+            if (w == 0x0004EB00u || w == 0x0004EB04u) {
+                /* ...and raise it exactly as the walker would have: the guest's
+                 * user handler (UE3's frame/flip bookkeeping) runs off it, and a
+                 * skipped one is a frame-completion signal that never arrives. */
+                const u32 dea = gcm_io2ea(io + 4);
+                if (dea) {
+                    extern void rsx_raise_user_cmd(u32 arg);
+                    extern void cellGcmQueueUserCommand(u32 cmd);
+                    const u32 arg = vm_read32(dea);
+                    rsx_raise_user_cmd(arg);
+                    if (s_user_handler_opd) cellGcmQueueUserCommand(arg);
+                }
+                ucmds++; io += 4; continue;
+            }
             /* A flip marker skipped here will never be reached: count it, or
              * every flip after it waits for the drain forever. */
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
@@ -1852,6 +1975,17 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
+        }
+        if (ucmds && mm_ucmd_on()) {
+            int id = -1, last = -1;
+            for (unsigned k = 0; k < ucmds && (id = mm_prep_pop()) >= 0; k++) last = id;
+            if (last >= 0) {                     /* show the newest skipped frame once */
+                gcm_set_current_display_buffer((u32)last);
+                s_flip_request_count++;
+                s_flip_pending = 1;
+            }
+            { static int m = 0; if (PS3_LOG_FIRST(m, 8))
+                fprintf(stderr, "[MMFLIP] resync skipped %u flip user command(s)\n", ucmds); }
         }
         /* Fences are not the only sync writes a title waits on. Walk the
          * skipped range as a command stream (each header and its data; NOPs,
@@ -2830,6 +2964,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * The `continue` skips the 0xEB00 case below, so queue
                      * it for the pump here. */
                     if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
+                    mm_ucmd_flip();
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -2951,6 +3086,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(vm_read32(dea));
+                    mm_ucmd_flip();
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
@@ -2960,6 +3096,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 }
             }
             s_fifo_getoff += 4 + count * 4;
+            if (s_mm_ucmd_stop) { s_mm_ucmd_stop = 0; why = "flip"; break; }
             continue;
         }
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
@@ -3548,31 +3685,40 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 }
 
 /* NID: 0xA2478CA3 */
+static int s_mm_prep_fifo = 0;   /* a prepared flip sits in the FIFO */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
-    (void)ctx;  /* command buffer context -- not used in HLE */
-
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
-
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+    { static unsigned n; if (n++ < 8) printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId); }   /* MM: was per frame (100+ MB/h of log) */
 
-    gcm_set_current_display_buffer(bufferId);
+    /* Default: present at call time (the original runtime behaviour, which
+     * rendered the menus correctly). MM_FLIP_FIFO=1 queues a flip marker in
+     * the command stream instead -- experimental: in testing it stalled the
+     * boot at the menu load and burned the loading screen white. */
+    static int fifo = -1; if (fifo < 0) fifo = getenv("MM_FLIP_FIFO") ? 1 : 0;
+    if (fifo && gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId)) {
+        s_mm_prep_fifo = 1;
+    } else if (mm_ucmd_on() && mm_prep_push((int)bufferId)) {
+        s_mm_prep_fifo = 0;             /* shown when the drain reaches the user command */
+    } else {
+        { static unsigned n; if (n++ < 8) printf("[MMFLIP] prepared-flip queue full -> PPU-time flip\n"); }
+        s_mm_prep_fifo = 0;
+        gcm_set_current_display_buffer(bufferId);
+        s_flip_request_count++;
+    }
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
-
-    /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
-     * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
-     * jumps into guest code and crashes. See cellGcmSetFlipCommand for why
-     * GCM_FLIPCB_ONTICK exists. */
     if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
-
-    return CELL_OK;
+    /* MM: libgcm returns the prepared flip id. UE3 packs it into the user
+     * command and its user handler calls cellGcmSetFlipImmediate(id);
+     * returning CELL_OK (0) made every immediate flip show buffer 0, so the
+     * screen alternated between the new frame and a stale one. */
+    return (s32)bufferId;
 }
 
 /* NID: 0x1BFAB6EE */
@@ -4590,7 +4736,14 @@ u32 cellGcmGetDefaultSegmentWordSize(void)
 /* Immediate flip — perform flip right now */
 s32 cellGcmSetFlipImmediate(u32 bufferId)
 {
-    printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
+    /* MM: the prepared flip already sits in the FIFO and presents when the
+     * drain reaches it; flipping again here showed a half-drained frame. */
+    if (s_mm_prep_fifo || mm_ucmd_on()) return CELL_OK;
+    /* MM_FLIP_NOIMM=1 (experiment): PrepareFlip already presented this id;
+     * skip the second, possibly mid-drain, present. */
+    { static int ni = -1; if (ni < 0) ni = getenv("MM_FLIP_NOIMM") ? 1 : 0;
+      if (ni) return CELL_OK; }
+    { static unsigned n; if (n++ < 8) printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId); }   /* MM: was per frame (100+ MB/h of log) */
     return cellGcmSetFlipCommand(bufferId);
 }
 

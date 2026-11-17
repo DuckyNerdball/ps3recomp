@@ -7,7 +7,7 @@
 function(ps3recomp_generate_spu output_dir)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(command "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/build_spu_workloads.py"
-        --lifted "${output_dir}" --out "${output_dir}/spu_workloads.c" --constructor)
+        --lifted "${output_dir}" --out "${output_dir}/spu_workloads.c" --constructor --allow-partial)
     if(PS3RECOMP_SPU_MERGE_CHUNKS)
         list(APPEND command --merge-chunks)
     endif()

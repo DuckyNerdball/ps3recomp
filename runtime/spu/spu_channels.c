@@ -260,6 +260,22 @@ static uint64_t spu_float_mode_enter(void)
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
     __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)SPU_FPCR_RZFZ));
     return v;
+#elif (defined(__x86_64__) || defined(_M_X64)) && defined(__SSE4_1__) && !defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS)
+    /* x86: MXCSR round toward zero + FTZ + DAZ (spu_helpers.h spu__x4_rz). */
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = e && e[0] == '1' && !e[1];
+        __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
+    }
+    if (!on) return ~0ull;
+    const unsigned v = _mm_getcsr();
+    g_spu_x4_rz = 1;
+    if ((v & 0xFFC0u) == 0xFFC0u) return ~0ull;   /* nested run: the outer one restores */
+    _mm_setcsr(0xFFC0u);
+    { static volatile long n; if (_InterlockedIncrement(&n) <= 4) fprintf(stderr, "[spu-float] RZ mode on (MXCSR 0x%04X -> 0xFFC0) tid=%lu\n", v, GetCurrentThreadId()); }
+    return v;
 #else
     return ~0ull;
 #endif
@@ -268,6 +284,8 @@ static void spu_float_mode_leave(uint64_t outer)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     if (outer != ~0ull) __asm__ volatile("msr fpcr, %0" :: "r"(outer));
+#elif (defined(__x86_64__) || defined(_M_X64)) && defined(__SSE4_1__) && !defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS)
+    if (outer != ~0ull) _mm_setcsr((unsigned)outer);
 #else
     (void)outer;
 #endif
@@ -399,9 +417,9 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
         AcquireSRWLockShared(&s_mfc_claim_lock);
         for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next, i++) {
             spu_context* c = slot->ctx;
-            if (c) fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
+            if (c) fprintf(stderr, "[pcsample] slot=%d img=%d task=%d st=%d spu=0x%X pc=0x%05X lr=0x%05X"
                                    " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
-                           i, c->image_id, c->spu_id, (unsigned)(c->pc & SPU_LS_MASK),
+                           i, c->image_id, (int)c->resident_task, (int)c->status, c->spu_id, (unsigned)(c->pc & SPU_LS_MASK),
                            (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
                            c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
         }
@@ -468,7 +486,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
     { static volatile LONG checked = 0;
       if (!checked && !InterlockedExchange(&checked, 1)) {
           const char* e = getenv("SPU_PCSAMPLE");
-          if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+          const char* em = getenv("SPU_PCSAMPLE_MS");   /* finer interval, in ms */
+          if (em) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)atoi(em), 0, NULL);
+          else if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
       } }
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
@@ -722,7 +742,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * policy-module poll -- publishes its reservation and copies without
          * the lock; any write the copy misses ends that reservation (see
          * spu_coh_reserve_fast). Anything else takes the lock as before. */
-        const int llar_fast = spu_coh_reserve_fast(ctx, ea);
+        /* MM_LLAR_LOCKED=1: never take the lock-free fast path. Its copy can be
+         * torn against a peer SPU's PUTLLC, and the SPURS policy module checks
+         * the taskset bitmaps it just read BEFORE its PUTLLC (hlgti at LS 0xF00
+         * in libsre module 0x02023680) -- a torn read halts the SPU instead of
+         * failing the PUTLLC. Suspected cause of the lifted-scheduler halt. */
+        static int s_mm_llar_locked = -1;
+        if (s_mm_llar_locked < 0) { const char* e = getenv("MM_LLAR_LOCKED"); s_mm_llar_locked = (e && e[0] != '0') ? 1 : 0;
+                                    if (s_mm_llar_locked) fprintf(stderr, "[mm] MM_LLAR_LOCKED: GETLLAR always takes the lock-line lock\n"); }
+        const int llar_fast = s_mm_llar_locked ? 0 : spu_coh_reserve_fast(ctx, ea);
         if (!llar_fast) {
             spu_lockline_lock();
             /* Tell the PPU store paths this line is live, so a store into it goes
@@ -778,6 +806,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                               " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+              /* MM: who is spinning -- residency and the last dispatched entries */
+              extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8]; extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+              fprintf(stderr, "[spu-spin]   ovl=%d task=%d depth=%d policy=%d last:", (int)ctx->resident_ovl, (int)ctx->resident_task,
+                      (int)ctx->host_depth, (int)ctx->policy_mode);
+              for (unsigned q = 0; q < 8; q++) fprintf(stderr, " %05X", g_spu_pch[(g_spu_pch_n + q) & 7u]);
+              fprintf(stderr, " r0..r6: %05X %05X %08X %08X %08X %08X\n", ctx->gpr[0]._u32[0] & 0x3FFFF, ctx->gpr[1]._u32[0] & 0x3FFFF,
+                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0]);
           } }
         if (!llar_fast) spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
@@ -880,6 +915,26 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                                 n, ctx->image_id, (void*)ctx, ea,
                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
             spu_coh_notify_write(ea);
+            /* MM_SPURS_PUTLOG=<hexEA>[,<hexEA>]: log every committed PUTLLC to
+             * those lines (first 400), with resident overlay and the last
+             * dispatched entries -- diff lifted vs interpreted policy module. */
+            { static int s_pl = -1; static uint32_t s_pea[2];
+              if (s_pl < 0) { const char* e = getenv("MM_SPURS_PUTLOG"); s_pl = 0;
+                if (e && *e) { s_pea[0] = (uint32_t)strtoul(e, 0, 16) & ~127u; const char* c = strchr(e, ',');
+                  s_pea[1] = c ? (uint32_t)strtoul(c + 1, 0, 16) & ~127u : s_pea[0]; s_pl = 1; } }
+              if (s_pl && ((ea & ~127u) == s_pea[0] || (ea & ~127u) == s_pea[1])) {
+                static unsigned long n_pl; static uint8_t last[2][128]; const int w = (ea & ~127u) == s_pea[1] && s_pea[1] != s_pea[0];
+                const uint8_t* m = (const uint8_t*)mem;
+                if (memcmp(last[w], m, 128) != 0 && n_pl++ < 3000) {
+                  memcpy(last[w], m, 128);
+                  extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8]; extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+                  fprintf(stderr, "[mm-put] #%lu ea=%08X ovl=%d task=%d pc=%05X lr=%05X last=%05X,%05X,%05X |", n_pl, ea & ~127u,
+                          (int)ctx->resident_ovl, (int)ctx->resident_task, ctx->pc & 0x3FFFF, ctx->gpr[0]._u32[0] & 0x3FFFF,
+                          g_spu_pch[(g_spu_pch_n + 5) & 7u], g_spu_pch[(g_spu_pch_n + 6) & 7u], g_spu_pch[(g_spu_pch_n + 7) & 7u]);
+                  for (int b = 0; b < 0x80; b += 4) {
+                    if ((b & 0xF) == 0) fprintf(stderr, " %02X:", b);
+                    fprintf(stderr, "%02X%02X%02X%02X", m[b], m[b+1], m[b+2], m[b+3]); }
+                  fprintf(stderr, "\n"); fflush(stderr); } } }
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
@@ -1221,6 +1276,19 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
+        /* Re-check interval. Producers that set a channel through this runtime
+         * wake the condition variable at once; a PPU store to a line the SPU
+         * holds a reservation on does not -- it is a plain memory write in the
+         * lifted code -- so an idle SPURS kernel waiting for the lost-
+         * reservation event (event channel, reservation armed) only saw a kick
+         * on the next timeout. 10 ms of that per mix pass starved FMOD's
+         * private one-SPU SPURS (Monster Madness: ~50% audio dropouts).
+         * MM_SPU_CHWAIT_MS sets the interval for all waits; the reservation
+         * case defaults to 1 ms, everything else keeps 10. */
+        static int s_cw = -2;
+        if (s_cw == -2) { const char* e = getenv("MM_SPU_CHWAIT_MS"); s_cw = e ? atoi(e) : -1; }
+        const DWORD wait_ms = s_cw >= 0 ? (DWORD)s_cw
+                            : ((channel == 0 /* SPU_RdEventStat */ && ctx->resv_valid) ? 1u : 10u);
         while (!spu_ch_ready(ctx, channel)) {
             if (ctx->stop_request) {
                 yz_lockstep_block_end(ctx);
@@ -1229,7 +1297,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel))
                 SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
+                                          (SRWLOCK*)&ctx->ch_wait_lock, wait_ms, 0);
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             unsigned long long waited = GetTickCount64() - start;
             if (waited >= next_hb) {
@@ -1838,8 +1906,45 @@ static void spu_dcache_shadow_stats(void)
                 __atomic_load_n(&s_dcache_misses, __ATOMIC_RELAXED),
                 __atomic_load_n(&s_dcache_shadow_bad, __ATOMIC_RELAXED));
 }
+/* MM_OVL_VERIFY (default on; =0 off): an EA-keyed overlay is only trusted
+ * while the local store still holds its first 32 bytes. SPURS streams its
+ * two policy modules (libsre 0x02021480 job chain / 0x02023680 taskset) to
+ * the same LS 0xA00; when the residency record went stale, the lifted
+ * taskset PM ran over the job chain's data (halt at 0xF00, GETLLAR spin on
+ * the job chain line at 0xA70). Checked on every lookup -- 32 bytes. */
+static struct { int image_id; uint32_t src_ea, lsa; } s_mm_ovl_map[8];
+static int s_mm_ovl_map_n;
+static void mm_ovl_map_note(int image_id, uint32_t src_ea, uint32_t lsa)
+{
+    for (int i = 0; i < s_mm_ovl_map_n; i++)
+        if (s_mm_ovl_map[i].image_id == image_id) { s_mm_ovl_map[i].src_ea = src_ea; s_mm_ovl_map[i].lsa = lsa; return; }
+    if (s_mm_ovl_map_n < 8) { s_mm_ovl_map[s_mm_ovl_map_n].image_id = image_id; s_mm_ovl_map[s_mm_ovl_map_n].src_ea = src_ea;
+                              s_mm_ovl_map[s_mm_ovl_map_n].lsa = lsa; __atomic_store_n(&s_mm_ovl_map_n, s_mm_ovl_map_n + 1, __ATOMIC_RELEASE); }
+}
+static void mm_ovl_verify(spu_context* c)
+{
+    static int on = -1; if (on < 0) { const char* e = getenv("MM_OVL_VERIFY"); on = !(e && e[0] == '0'); }
+    if (!on || !c->resident_ovl) return;
+    const int n = __atomic_load_n(&s_mm_ovl_map_n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        if (s_mm_ovl_map[i].image_id != c->resident_ovl) continue;
+        const uint32_t l = s_mm_ovl_map[i].lsa;
+        if (l + 32 <= SPU_LS_SIZE && memcmp(c->ls + l, vm_base + s_mm_ovl_map[i].src_ea, 32) == 0) return;
+        /* stale: find the registered module that IS there, else none */
+        int now = 0;
+        for (int j = 0; j < n; j++)
+            if (s_mm_ovl_map[j].lsa == l && memcmp(c->ls + l, vm_base + s_mm_ovl_map[j].src_ea, 32) == 0) { now = s_mm_ovl_map[j].image_id; break; }
+        static unsigned long n_fix;
+        if (n_fix++ < 16)
+            fprintf(stderr, "[mm-ovl] img=%d resident ovl %d no longer in LS 0x%05X -> %d (verify)\n", c->image_id, c->resident_ovl, l, now);
+        c->resident_ovl = now;
+        spu_dcache_residency_changed(c);
+        return;
+    }
+}
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    if (ctx) mm_ovl_verify((spu_context*)ctx);
     const int mode = spu_dcache_mode();
     if (!mode || !ctx) return spu_lifted_lookup_full(ctx, lsa, NULL);
     spu_context* c = (spu_context*)ctx;
@@ -2090,7 +2195,7 @@ static void spu_check_stack_reset_scan(spu_context* ctx, void (*fn)(spu_context*
  * into the entry from outside the region. This is what lets each such task be
  * registered under its own real image id instead of the id-0 wildcard, so a
  * dormant co-resident task can no longer shadow the one the policy launched. */
-#define SPU_TASK_ENTRY_MAX 16
+#define SPU_TASK_ENTRY_MAX 32   /* MonsterDigger registers 18 task ELFs (2 policies x 9) */
 static struct { uint32_t entry; int image_id; } s_task_entry[SPU_TASK_ENTRY_MAX];
 static int s_task_entry_count = 0;
 void spu_taskset_register_task_entry(uint32_t entry, int image_id)
@@ -2134,6 +2239,22 @@ static int spu_taskset_resident_image(const spu_context* ctx)
 /* Lowest LS address of the shared task-code region: the taskset tasks all lift
  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
 #define SPU_TASKSET_TASK_LO 0x3000u
+
+/* Relocatable code span matched by CONTENT, for position-independent code the
+ * title first copies to the heap (so its source EA is unknowable) and then DMAs
+ * to a different LS address each run. A GET of >= 512 bytes whose first 16
+ * bytes equal `sig` makes [lsa, lsa+span) resident under image_id with
+ * reloc_delta = lsa - canon. Monster Madness's SPURS jobs need this. */
+void spu_overlay_register_sig(const uint8_t sig[16], int image_id);
+void spu_overlay_register_region_reloc_sig(const uint8_t sig[16], uint32_t span, uint32_t canon, int image_id)
+{
+    if (!canon || canon >= SPU_LS_SIZE || !span || span > SPU_LS_SIZE - canon) return;
+    { static int s_off = -1; if (s_off < 0) { const char* e = getenv("SPU_RELOC_OFF"); s_off = e && e[0] == '1'; }
+      if (s_off) return; }
+    const int n = s_ovl_src_count;
+    spu_overlay_register_sig(sig, image_id);
+    if (s_ovl_src_count == n + 1) { s_ovl_src[n].span = span; s_ovl_src[n].canon = canon; }
+}
 
 /* Content-signature variant: FMOD COPIES codec overlays to the heap before
  * streaming them into the swap slot, so the source EA is unknowable ahead of
@@ -2208,6 +2329,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
+    /* MM_GETLOG=N: the first N GETs of >= 4 KB into task-code LS (>= 0x3000),
+     * with the first 16 bytes -- where a code segment is really loaded from. */
+    { static int cap = -1, n = 0;
+      if (cap < 0) { const char* e = getenv("MM_GETLOG"); cap = e ? atoi(e) : 0; }
+      static uint32_t lo = 0xFFFFFFFFu;
+      if (lo == 0xFFFFFFFFu) { const char* e = getenv("MM_GETLOG_LSA"); lo = e ? (uint32_t)strtoul(e, NULL, 16) : 0x3000u; }
+      if (cap && n < cap && size >= 1024 && lsa >= lo) { n++; extern unsigned long long ps3_qpc_us(void);
+          fprintf(stderr, "[GETLOG] t=%llu spu=0x%X pc=0x%05X task=%d img=%d ea=0x%08X -> LS 0x%05X size=0x%X first=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                  ps3_qpc_us(), ctx->spu_id, (unsigned)(ctx->pc & SPU_LS_MASK), (int)ctx->resident_task, ctx->image_id, ea, lsa, size, ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[6], ls[7]); } }
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
@@ -2222,6 +2352,34 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
         }
     }
+    /* MM: an EA-keyed overlay (spu_overlay_register_source, no span) stayed
+     * "resident" when a DIFFERENT module was streamed over it. SPURS streams
+     * its policy modules to LS 0xA00: the taskset module (lifted, registered)
+     * and the job-chain module (not registered). After the job chain module
+     * replaced it, dispatch kept running the lifted TASKSET code on the job
+     * chain's lock line (ea 0x01797C00 = the job chain) -> hlgti halt at 0xF00.
+     * Any GET of >= 512 bytes covering the overlay's load address that is not
+     * from the overlay's own source ends the residency. MM_OVL_KEEP=1 = old. */
+    {
+        static SPU_THREAD_LOCAL const void* t_ctx; static SPU_THREAD_LOCAL uint32_t t_lsa, t_ea;
+        static int keep = -1; if (keep < 0) { const char* e = getenv("MM_OVL_KEEP"); keep = (e && e[0] == '1'); }
+        if (!keep && ctx->resident_ovl && t_ctx == (const void*)ctx && size >= 512 &&
+            lsa <= t_lsa && t_lsa < lsa + size && ea != t_ea) {
+            static unsigned long n_drop;
+            if (n_drop++ < 8)
+                fprintf(stderr, "[mm-ovl] img=%d GET ea=0x%08X -> LS 0x%05X size=%u replaced resident ovl %d (src 0x%08X): residency dropped\n",
+                        ctx->image_id, ea, lsa, size, ctx->resident_ovl, t_ea);
+            ctx->resident_ovl = 0;
+            spu_dcache_residency_changed(ctx);
+        }
+        /* remember where the current EA-keyed overlay was loaded (set below) */
+        if (!keep) {
+            int nsrc0 = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+            for (int i = 0; i < nsrc0; i++)
+                if (!s_ovl_src[i].has_sig && !s_ovl_src[i].span && s_ovl_src[i].src_ea == ea && size >= 512) {
+                    t_ctx = ctx; t_lsa = lsa; t_ea = ea; break; }
+        }
+    }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
     /* Invalidate destination code/residency above even for an unrelated EA.
      * Acquire count before the signature flag: if this snapshot contains a
@@ -2229,6 +2387,52 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
      * signature can only force an unnecessary scan of the older snapshot. */
     if ((size < 512 || !atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) &&
         !spu_ovl_ea_known(ea)) return;
+    /* Relocatable spans matched by content can also arrive PACKED: Monster
+     * Madness copies two SPURS jobs back to back into one heap block and loads
+     * both with a single GET, so the second job's signature sits inside the
+     * transfer, not at its start. Claim every such embedded placement (16-byte
+     * aligned, past offset 0 -- the start is handled by the loop below). */
+    if (size >= 512 && atomic_load_explicit(&s_ovl_has_sig, memory_order_acquire)) {
+        for (int i = 0; i < nsrc; i++) {
+            const spu_ovl_src* o = &s_ovl_src[i];
+            if (!o->has_sig || !o->span || !o->canon) continue;
+            for (uint32_t k = 16; k + 16 <= size; k += 16) {
+                if (ls[k] != o->sig[0] || memcmp(ls + k, o->sig, 16) != 0) continue;
+                const uint32_t at = lsa + k;
+                if (at + o->span > SPU_LS_SIZE) break;
+                for (unsigned slot = 0; slot < 4; ++slot) {
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != at &&
+                        ctx->resident_code[slot].image_id != o->image_id)
+                        continue;
+                    ctx->resident_code[slot].lsa = at;
+                    ctx->resident_code[slot].size = o->span;
+                    ctx->resident_code[slot].source_ea = ea + k;
+                    ctx->resident_code[slot].image_id = o->image_id;
+                    ctx->resident_code[slot].verify_state = 0;
+                    ctx->resident_code[slot].source_index = i;
+                    ctx->resident_code[slot].canon = o->canon;
+                    spu_dcache_residency_changed(ctx);
+                    break;
+                }
+                break;   /* one placement per image per transfer */
+            }
+        }
+    }
+    /* A GET continuing a partially-resident EA-keyed region (its EA and LS
+     * both follow on from what the slot already covers) extends the claim. */
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (!ctx->resident_code[slot].image_id) continue;
+        const int si = ctx->resident_code[slot].source_index;
+        if (si < 0 || si >= nsrc) continue;
+        const spu_ovl_src* o = &s_ovl_src[si];
+        if (o->has_sig || !o->span || o->canon || o->src_ea != ctx->resident_code[slot].source_ea) continue;
+        const uint32_t cur = ctx->resident_code[slot].size;
+        if (cur >= o->span || ea < o->src_ea) continue;
+        const uint32_t rel = ea - o->src_ea;
+        if (rel > cur || rel >= o->span || lsa != ctx->resident_code[slot].lsa + rel) continue;
+        uint32_t ns = rel + size; if (ns > o->span) ns = o->span;
+        if (ns > cur) { ctx->resident_code[slot].size = ns; spu_dcache_residency_changed(ctx); }
+    }
     for (int i = 0; i < nsrc; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -2245,7 +2449,15 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                         !(o->canon && ctx->resident_code[slot].image_id == o->image_id))
                         continue;
                     ctx->resident_code[slot].lsa = lsa;
-                    ctx->resident_code[slot].size = o->span;
+                    /* An EA-keyed region is resident only as far as this GET
+                     * reached: a task that streams its own overlays into the
+                     * same span (FMOD: 0x4000 from the image start, 0x1270 of
+                     * another overlay at +0x2F80) left the old full-span claim
+                     * dispatching lifted code over bytes it never loaded --
+                     * the guest stopped flipping. Later GETs continuing the
+                     * image extend the claim (below). MM_OVL_FULLSPAN=1: old. */
+                    { static int s_full = -1; if (s_full < 0) s_full = getenv("MM_OVL_FULLSPAN") ? 1 : 0;
+                      ctx->resident_code[slot].size = (o->has_sig || s_full || size >= o->span) ? o->span : size; }
                     ctx->resident_code[slot].source_ea = ea;
                     ctx->resident_code[slot].image_id = o->image_id;
                     ctx->resident_code[slot].verify_state = o->code ? SPU_OVERLAY_PENDING : 0;
@@ -2259,6 +2471,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
             if (ctx->resident_ovl != o->image_id) {
                 ctx->resident_ovl = o->image_id;
+                if (!o->has_sig) mm_ovl_map_note(o->image_id, o->src_ea, (uint32_t)(ls - ctx->ls));
                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 32))
                     fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
                             "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
@@ -2766,8 +2979,22 @@ void spu_indirect_branch(spu_context* ctx)
             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
             (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
         int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
-        if (ctx->image_id == 22 || standalone ||
-            (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
+        /* MM_PM_REAL_SYSCALL=1: when Sony's taskset policy module is lifted and
+         * resident (resident_ovl has 0xA70), run it instead of the HLE syscall.
+         * Interpreted task code reaches the real PM code; lifted task code came
+         * through here and got the HLE -- two syscall implementations against
+         * one taskset. */
+        static int s_mm_realsc = -1;
+        if (s_mm_realsc < 0) { const char* e = getenv("MM_PM_REAL_SYSCALL"); s_mm_realsc = (e && e[0] == '1'); }
+        const int mm_real = s_mm_realsc && ctx->resident_ovl &&
+                            spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl);
+        /* MM_NO_TASK_HLE=1: never HLE the task syscall at 0xA70 -- run Sony's
+         * policy-module code (lifted or interpreted) like hardware. Every
+         * "working" config so far went through the HLE, never Sony's path. */
+        static int s_mm_nohle = -1;
+        if (s_mm_nohle < 0) { const char* e = getenv("MM_NO_TASK_HLE"); s_mm_nohle = (e && e[0] == '1'); }
+        if (!mm_real && !s_mm_nohle && (ctx->image_id == 22 || standalone ||
+            (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS))) {
             spu_spurs_taskset_syscall(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
@@ -2839,6 +3066,7 @@ void spu_indirect_branch(spu_context* ctx)
      * is usually not an ELF entry. Prefer the policy's selected ELF so tasks
      * sharing an entry address cannot shadow one another. Keep the legacy
      * entry-only mapping for runners that have not registered ELF metadata. */
+    const int mm_prev_task = ctx->resident_task;
     if (ctx->pc < SPU_TASKSET_TASK_LO) {
         ctx->resident_task = 0;
     } else {
@@ -2854,8 +3082,43 @@ void spu_indirect_branch(spu_context* ctx)
             SPU_LONGJMP(s_spu_halt_env, 2);
         }
         if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
+        /* MM_TASKELF_DBG=1: a task PC no registered ELF claims -- print the ELF
+         * EA the policy recorded (taskInfo.elf), once per distinct value, so an
+         * ELF the title copies to the heap before launching can be registered
+         * at the address it actually runs from. */
+        if (!ti && !ctx->resident_task) {
+            static int dbg = -1; if (dbg < 0) dbg = getenv("MM_TASKELF_DBG") ? 1 : 0;
+            if (dbg) {
+                const uint8_t* q = ctx->ls + 0x2794;
+                const uint32_t elf = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+                static uint32_t seen[16]; static int ns = 0; int f = 0;
+                for (int k = 0; k < ns; k++) if (seen[k] == elf) f = 1;
+                if (!f && ns < 16) { seen[ns++] = elf;
+                    fprintf(stderr, "[TASKELF] unclaimed task pc=0x%05X taskInfo.elf=0x%08X resident_ovl=%d image=%d\n",
+                            ctx->pc, elf, ctx->resident_ovl, ctx->image_id);
+                    /* MM_TASKELF_DUMP=<dir>: write 512 KB of guest memory from
+                     * that ELF's EA, to identify where the title got it. */
+                    { const char* d = getenv("MM_TASKELF_DUMP");
+                      if (d && elf && elf < 0xFFF80000u) { char path[512];
+                          snprintf(path, sizeof path, "%s/taskelf_%08X.bin", d, elf);
+                          FILE* f = fopen(path, "wb");
+                          if (f) { fwrite(vm_base + elf, 1, 0x80000, f); fclose(f);
+                                   fprintf(stderr, "[TASKELF] dumped %s\n", path); } } } } }
+        }
         if (ti) ctx->resident_task = ti;
     }
+    /* MM_TASKLOG=<image>: time each entry to / exit from that task image (with
+     * pc), to split a task's wake latency from its run time. */
+    { static int s_tl = -2, s_tn = 0;
+      if (s_tl == -2) { const char* e = getenv("MM_TASKLOG"); s_tl = e ? (int)strtol(e, 0, 0) : 0; }
+      /* ...and publish the host thread running it, for PS3_SAMPLE_SPUTASK. */
+      { extern volatile unsigned long g_mm_samp_spu_tid;
+        if (s_tl && ctx->resident_task == s_tl) { g_mm_samp_spu_tid = GetCurrentThreadId();
+          static int once; if (!once) { once = 1; fprintf(stderr, "[spu-float] task thread %lu MXCSR=0x%04X\n", GetCurrentThreadId(), _mm_getcsr()); } } }
+      if (s_tl && (mm_prev_task == s_tl) != (ctx->resident_task == s_tl) && s_tn++ < 6000) {
+          extern unsigned long long ps3_qpc_us(void);
+          fprintf(stderr, "[TASKLOG] t=%llu spu=0x%X %s pc=0x%05X\n", ps3_qpc_us(), ctx->spu_id,
+                  ctx->resident_task == s_tl ? "enter" : "leave", (unsigned)(ctx->pc & SPU_LS_MASK)); } }
     /* Use the same ownership order as the interpreter's rejoin probe. */
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
@@ -2961,7 +3224,14 @@ void spu_indirect_branch(spu_context* ctx)
               if (PS3_LOG_FIRST(_n, 8))
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
-              spu_interp_run(ctx, p);
+              /* MM_IU_UNTIL=1: stop at the innermost drain's return pc. Lifted
+               * code that calls unlifted code (libsre PM -> kernel 0x2FA20) waits
+               * in spu_drain_call(ctx, RET); spu_interp_run interpreted straight
+               * past RET, so the lifted caller later re-ran its own tail. */
+              static int s_until = -1;
+              if (s_until < 0) { const char* e = getenv("MM_IU_UNTIL"); s_until = (e && e[0] == '1'); }
+              if (s_until && ctx->drain_ret_pc) spu_interp_run_until(ctx, p, ctx->drain_ret_pc);
+              else spu_interp_run(ctx, p);
               return;
           } }
         spu_halt(ctx);

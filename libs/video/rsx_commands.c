@@ -216,6 +216,13 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
     switch (reg) {
     case 0x00: /* TEXTURE_OFFSET */
         tex->offset = data & 0x7FFFFFFFu;   /* 31-bit offset; bit 31 is not an address bit */
+        /* MM_TEXOFF_WATCH=<hex>[:<hex>]: report texture units loaded with an
+         * offset in [lo, hi] (e.g. a depth surface the title samples). */
+        { static int init = 0; static u32 lo = 0, hi = 0; static int n = 0;
+          if (!init) { init = 1; const char* e = getenv("MM_TEXOFF_WATCH");
+                       if (e) { char* d; lo = (u32)strtoul(e, &d, 16); hi = (*d == ':') ? (u32)strtoul(d + 1, NULL, 16) : lo; } }
+          if (lo && tex->offset >= lo && tex->offset <= hi && n < 40) { n++;
+              fprintf(stderr, "[TEXOFF] unit=%u offset=0x%08X%c", unit, tex->offset, 10); } }
         break;
     case 0x04: /* TEXTURE_FORMAT */
         tex->format = data;
@@ -326,6 +333,14 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
         attr->enabled   = (attr->size != 0);
         attr->format    = data;
         state->vertex_dirty = 1;
+        /* MM_VFMT_DBG=1: each distinct (attribute, format word) once. */
+        { static int dbg = -1; if (dbg < 0) dbg = getenv("MM_VFMT_DBG") ? 1 : 0;
+          if (dbg) { static u32 seen[256]; static int ns = 0; int f = 0;
+              const u32 key = (index << 28) ^ data;
+              for (int i = 0; i < ns; i++) if (seen[i] == key) { f = 1; break; }
+              if (!f && ns < 256) { seen[ns++] = key;
+                  fprintf(stderr, "[VFMT] attr%u fmt=0x%08X type=%u size=%u stride=%u freq=%u\n",
+                          index, data, attr->type, attr->size, attr->stride, attr->frequency); } } }
         return 0;
     }
 
@@ -677,6 +692,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->blend_dirty = 1;
         return 0;
     }
+    /* MM: SET_BLEND_COLOR (0x031C) feeds CONSTANT_COLOR/ALPHA blend factors.
+     * SET_BLEND_COLOR2 (0x0378) is the FP16 high half; accepted, unused. */
+    if (method == 0x031C) { state->blend_color = data; state->blend_dirty = 1; return 0; }
+    if (method == 0x0378) { return 0; }
     if (method == NV4097_SET_BLEND_EQUATION) {
         state->blend_equation = data;
         state->blend_dirty = 1;
@@ -972,11 +991,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 
     /* Unrecognized method -- log in debug builds */
 #ifndef NDEBUG
-    static int s_unknown_count = 0;
-    if (s_unknown_count < 50) {
-        printf("[RSX] unknown method 0x%04X = 0x%08X\n", method, data);
-        s_unknown_count++;
-    }
+    /* MM: report every DISTINCT unknown method once (the old first-50 cap only
+     * ever showed boot-time methods), plus a running count every 2^16. */
+    { static unsigned char s_seen[0x4000]; static unsigned long s_tot = 0;
+      const unsigned i = (method >> 2) & 0x3FFFu;
+      if (!s_seen[i]) { s_seen[i] = 1;
+          printf("[RSX] unknown method 0x%04X = 0x%08X (first)\n", method, data); }
+      if ((++s_tot & 0xFFFFu) == 0) printf("[RSX] unknown methods so far: %lu\n", s_tot); }
 #endif
 
     return -1;

@@ -444,6 +444,23 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             }
         interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
     }
+    /* MM_INTERP_PEEK=<hex pc>: the first time the interpreter is entered at
+     * that pc, print the 32 LS bytes there (which code body is really
+     * resident -- compare against a lift's source bytes). */
+    { static int np = -1; static uint32_t pks[8]; static int done[8];
+      if (np < 0) { np = 0; const char* e = getenv("MM_INTERP_PEEK");
+          while (e && *e && np < 8) { char* d; pks[np++] = (uint32_t)strtoul(e, &d, 16); e = (*d == ',') ? d + 1 : NULL; } }
+      int hit = -1; for (int q = 0; q < np; q++) if (!done[q] && pks[q] == (start_lsa & 0x3FFFC)) hit = q;
+      if (hit >= 0) { done[hit] = 1;
+          const uint8_t* b = ctx->ls + (start_lsa & 0x3FFFC);
+          fprintf(stderr, "[INTERP_PEEK] img=%d pc=0x%05X:", ctx->image_id, start_lsa & 0x3FFFC);
+          for (int i = 0; i < 32; i++) fprintf(stderr, "%s%02X", (i % 4) ? "" : " ", b[i]);
+          fprintf(stderr, "\n");
+          /* MM_INTERP_LSDUMP=<dir>: and write the whole local store (local
+           * diagnostics only -- never commit it). */
+          { const char* d = getenv("MM_INTERP_LSDUMP");
+            if (d) { char path[512]; snprintf(path, sizeof path, "%s/ls_%05X.bin", d, start_lsa & 0x3FFFC);
+                     FILE* f = fopen(path, "wb"); if (f) { fwrite(ctx->ls, 1, 0x40000, f); fclose(f); } } } } }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;

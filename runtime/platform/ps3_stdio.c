@@ -106,6 +106,40 @@ static unsigned ps3_stdio_env_ms(const char* name, unsigned def)
     return (unsigned)v;
 }
 
+#ifdef _WIN32
+/* MM: report a host STACK_OVERFLOW from the faulting thread: thread name and
+ * the top frames as module RVAs (symbolize against MyGameRecomp.pdb). Static
+ * buffers only -- the overflowed stack has ~one guard page left. */
+static char s_mm_so_buf[4096];
+static LONG WINAPI mm_so_veh(EXCEPTION_POINTERS* ep)
+{
+    if (!ep || !ep->ExceptionRecord || ep->ExceptionRecord->ExceptionCode != 0xC00000FDu)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    static void* fr[62];
+    USHORT n = RtlCaptureStackBackTrace(0, 62, fr, NULL);
+    ULONG_PTR base = (ULONG_PTR)GetModuleHandleA(NULL);
+    static WCHAR* wname; wname = NULL;
+    typedef HRESULT (WINAPI *gtd_fn)(HANDLE, PWSTR*);
+    gtd_fn gtd = (gtd_fn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    if (gtd) gtd(GetCurrentThread(), &wname);
+    int o = 0;
+    o += _snprintf(s_mm_so_buf + o, sizeof s_mm_so_buf - o, "\n[mm-so] STACK OVERFLOW tid=%lu name=\"",
+                   (unsigned long)GetCurrentThreadId());
+    for (int i = 0; wname && wname[i] && i < 60 && o < 200; i++) s_mm_so_buf[o++] = (char)wname[i];
+    o += _snprintf(s_mm_so_buf + o, sizeof s_mm_so_buf - o, "\" rip_rva=0x%llX frames=%u\n[mm-so] rvas:",
+                   (unsigned long long)((ULONG_PTR)ep->ExceptionRecord->ExceptionAddress - base), (unsigned)n);
+    for (USHORT i = 0; i < n && o < (int)sizeof s_mm_so_buf - 24; i++)
+        o += _snprintf(s_mm_so_buf + o, sizeof s_mm_so_buf - o, " %llX",
+                       (unsigned long long)((ULONG_PTR)fr[i] - base));
+    s_mm_so_buf[o++] = '\n';
+    DWORD w;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), s_mm_so_buf, (DWORD)o, &w, NULL);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 void ps3_stdio_init(void)
 {
     if (__atomic_exchange_n(&s_init_done, 1, __ATOMIC_ACQ_REL)) return;
@@ -142,6 +176,7 @@ void ps3_stdio_init(void)
     void (*prev)(int) = signal(SIGABRT, ps3_stdio_on_abort);
     s_prev_abort = (prev == SIG_ERR) ? NULL : prev;
     s_prev_filter = SetUnhandledExceptionFilter(ps3_stdio_on_crash);
+    AddVectoredExceptionHandler(1, mm_so_veh);
 
     fprintf(stderr, "[stdio] stdout/stderr buffered (%u KB each), flushed every %u ms"
                     " (PS3_STDIO_UNBUFFERED=1: unbuffered)\n",

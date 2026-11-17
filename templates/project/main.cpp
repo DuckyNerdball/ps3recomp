@@ -209,9 +209,21 @@ static DWORD WINAPI frame_clock(LPVOID)
     unsigned  last_flip = 0;
     ULONGLONG next_tick = GetTickCount64();
 
+    /* MM_CLOCK_SLEEP_MS: the drain cadence. The guest spins on RSX labels the
+     * drain writes (UE3: usleep(30) loop at 0x0087EA08), so every ms this
+     * thread sleeps is a ms the main thread can stall per GPU wait. */
+    static int s_clk_ms = -1;
+    if (s_clk_ms < 0) { const char* e = getenv("MM_CLOCK_SLEEP_MS"); s_clk_ms = e ? atoi(e) : 4; }
     for (;;) {
-        Sleep(4);
+        if (s_clk_ms > 0) Sleep((DWORD)s_clk_ms); else SwitchToThread();
         ULONGLONG now = GetTickCount64();
+        /* MM_FLIPSTAT=1: frame-clock heartbeat -- guest flip requests and
+         * frames presented, every 5 s. Stops printing = this thread is stuck. */
+        { static int on = -1; static ULONGLONG hb = 0; static unsigned lf = 0; static LONG lp = 0;
+          if (on < 0) on = getenv("MM_FLIPSTAT") ? 1 : 0;
+          if (on && now - hb >= 5000) { const unsigned fc = cellGcm_flip_request_count();
+              fprintf(stderr, "[CLOCK] flips +%u, presented +%ld\n", fc - lf, g_frames_presented - lp);
+              lf = fc; lp = g_frames_presented; hb = now; } }
 
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
@@ -454,6 +466,9 @@ int main(int argc, char** argv)
     g_ppu_main_stack_addr = STACK_TOP - STACK_SIZE;
     g_ppu_main_stack_size = STACK_SIZE;
 
+#ifdef _WIN32
+    { extern void ps3_sampler_start(void); ps3_sampler_start(); }   /* MM: PS3_SAMPLE=<ms>, PS3_SAMPLE_MAIN=1 */
+#endif
     int rc = run_guest(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 

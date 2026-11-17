@@ -137,6 +137,39 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    /* MM_USLEEP_CAP=<lr hex>:<us>[,<lr>:<us>...]: cap the sleep of the usleep
+     * called from that guest return address. A pacing sleep sized for real SPU
+     * speed (a mixer kicked after a fixed 5 ms nap) starves the work when the
+     * SPU side runs slower here; the title's own short poll still provides the
+     * backpressure. */
+    { static int s_nc = -1; static uint32_t s_lr[8]; static uint64_t s_us[8];
+      if (s_nc < 0) { int k = 0; const char* e = getenv("MM_USLEEP_CAP");
+          while (e && *e && k < 8) { char* q; s_lr[k] = (uint32_t)strtoul(e, &q, 16);
+              if (*q != ':') break; s_us[k] = strtoull(q + 1, &q, 10); k++;
+              e = (*q == ',') ? q + 1 : 0; }
+          s_nc = k; if (k) fprintf(stderr, "[usleep-cap] %d site(s)\n", k); }
+      for (int k = 0; k < s_nc; k++)
+          if ((uint32_t)ctx->lr == s_lr[k] && usec > s_us[k]) { usec = s_us[k]; break; } }
+    /* MM_FENCEWAIT64=<lr hex>: same for the render thread's ring-space poll
+     * (64-bit counter at *r27, target r31). */
+    { static int s_f6 = -1; static uint32_t s_f6lr;
+      if (s_f6 < 0) { const char* e = getenv("MM_FENCEWAIT64"); s_f6 = e ? 1 : 0; s_f6lr = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_f6 && (uint32_t)ctx->lr == s_f6lr) { static unsigned long n;
+          if ((++n % 2000) == 1) { extern uint8_t* vm_base; const uint32_t a = (uint32_t)ctx->gpr[27];
+              uint64_t v = 0; for (int i = 0; i < 8; i++) v = (v << 8) | vm_base[a + i];
+              fprintf(stderr, "[FENCEWAIT64] n=%lu addr=0x%08X val=0x%016llX want=0x%016llX r29=0x%08X\n", n, a,
+                      (unsigned long long)v, (unsigned long long)ctx->gpr[31], (uint32_t)ctx->gpr[29]); } } }
+    /* MM_FENCEWAIT=<lr hex>: for a usleep poll loop at that lr, report the
+     * polled word (r28) and target (r30) -- UE3's fence wait keeps them there. */
+    { static int s_fw = -1; static uint32_t s_fwlr;
+      if (s_fw < 0) { const char* e = getenv("MM_FENCEWAIT"); s_fw = e ? 1 : 0; s_fwlr = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_fw && (uint32_t)ctx->lr == s_fwlr) { static unsigned long n; static uint32_t la;
+          const uint32_t a = (uint32_t)ctx->gpr[28];
+          if ((++n % 20000) == 1 || a != la) { la = a;
+              extern uint8_t* vm_base;
+              const uint8_t* p = vm_base + a;
+              fprintf(stderr, "[FENCEWAIT] n=%lu addr=0x%08X val=0x%08X want=0x%08X\n", n, a,
+                      ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3], (uint32_t)ctx->gpr[30]); } } }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (PS3_LOG_FIRST(n, 60))
@@ -246,13 +279,44 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
-        HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        /* One HIGH_RESOLUTION waitable timer per thread. A plain waitable timer
+         * (the old code, created and destroyed on every call) fires on the
+         * system tick, and Windows 11 often keeps that at 15.6 ms for this
+         * process despite timeBeginPeriod(1): a guest audio mixer pacing itself
+         * with 5 ms usleeps ran at ~half real time (Monster Madness: 47% of
+         * audio blocks silent with every SPU job already native).
+         * MM_USLEEP_LEGACY=1 restores the old behaviour for A/B. */
+        static int legacy = -1;
+        if (legacy < 0) { const char* e = getenv("MM_USLEEP_LEGACY"); legacy = (e && e[0] == '1'); }
+        static __declspec(thread) HANDLE t_timer;
+        static __declspec(thread) int t_timer_tried;
+        if (!legacy && !t_timer_tried) {
+            t_timer_tried = 1;
+            t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                             TIMER_ALL_ACCESS);
+        }
+        HANDLE timer = (!legacy && t_timer) ? t_timer : CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
+            /* MM_USLEEP_STATS=1: requested vs actual sleep, per 2 s window. */
+            static int st = -1; if (st < 0) st = getenv("MM_USLEEP_STATS") ? 1 : 0;
+            LARGE_INTEGER s0 = {0}, s1 = {0};
+            if (st) { ensure_qpc_init(); QueryPerformanceCounter(&s0); }
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
-            CloseHandle(timer);
+            if (st) {
+                QueryPerformanceCounter(&s1);
+                static volatile long long req_sum, act_sum, cnt, t_last; static volatile long long hi_res;
+                const long long act = (long long)((s1.QuadPart - s0.QuadPart) * 1000000LL / s_qpc_freq.QuadPart);
+                req_sum += (long long)usec; act_sum += act; cnt++; hi_res = (timer == t_timer);
+                if (s1.QuadPart - t_last > 2 * s_qpc_freq.QuadPart) {
+                    if (t_last && cnt) fprintf(stderr, "[usleep-stats] %lld sleeps, avg requested %lld us, avg actual %lld us, hires=%lld\n",
+                                               cnt, req_sum / cnt, act_sum / cnt, hi_res);
+                    t_last = s1.QuadPart; req_sum = act_sum = cnt = 0;
+                }
+            }
+            if (timer != t_timer) CloseHandle(timer);
         } else {
             Sleep((DWORD)(usec / 1000));
         }

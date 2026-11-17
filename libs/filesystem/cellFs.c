@@ -964,6 +964,9 @@ s32 cellFsRename(const char* from, const char* to)
 
     ensure_parent_dirs(host_to);
 
+#ifdef _WIN32
+    remove(host_to);   /* PS3 rename replaces an existing target; Windows rename() refuses */
+#endif
     if (rename(host_from, host_to) != 0) {
         printf("[cellFs] Rename: rename('%s', '%s') failed: %s\n",
                host_from, host_to, strerror(errno));

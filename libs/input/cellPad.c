@@ -301,6 +301,55 @@ static int pad_key_down(int key)
 #define PADKEY_TAB SDL_SCANCODE_TAB
 #endif
 
+/* MM_AUTOPAD: scripted pad presses for unattended tests, independent of
+ * window focus. Comma list of "SEC:BTNS" or "FROM-TO/EVERY:BTNS" (seconds since
+ * the first pad poll); BTNS letters S=start X=cross O=circle T=triangle
+ * Q=square U/D/L/R=d-pad. Each press is held 400 ms. Example:
+ *   MM_AUTOPAD=60:S,70-600/6:X                                            */
+#include <time.h>
+static u16 mm_autopad_buttons(void)
+{
+    static int inited = 0, n = 0;
+    static struct { double from, to, every; u16 btn; } ev[64];
+    static double t0;
+    if (!inited) {
+        inited = 1;
+        const char* e = getenv("MM_AUTOPAD");
+        if (e && *e) {
+            char buf[1024]; strncpy(buf, e, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+            for (char* tok = strtok(buf, ","); tok && n < 64; tok = strtok(NULL, ",")) {
+                char* c = strchr(tok, ':'); if (!c) continue; *c = 0;
+                double from = atof(tok), to = from, every = 0;
+                char* dash = strchr(tok, '-'); if (dash) { to = atof(dash + 1); char* sl = strchr(dash, '/'); if (sl) every = atof(sl + 1); }
+                u16 b = 0;
+                for (const char* q = c + 1; *q; q++) switch (*q) {
+                    case 'S': b |= CELL_PAD_CTRL_START; break;   case 'X': b |= CELL_PAD_CTRL_CROSS; break;
+                    case 'O': b |= CELL_PAD_CTRL_CIRCLE; break;  case 'T': b |= CELL_PAD_CTRL_TRIANGLE; break;
+                    case 'Q': b |= CELL_PAD_CTRL_SQUARE; break;  case 'U': b |= CELL_PAD_CTRL_UP; break;
+                    case 'D': b |= CELL_PAD_CTRL_DOWN; break;    case 'L': b |= CELL_PAD_CTRL_LEFT; break;
+                    case 'R': b |= CELL_PAD_CTRL_RIGHT; break;   default: break; }
+                ev[n].from = from; ev[n].to = to; ev[n].every = every; ev[n].btn = b; n++;
+            }
+            fprintf(stderr, "[mm-autopad] %d scripted press rule(s)\n", n);
+        }
+        t0 = (double)clock() / CLOCKS_PER_SEC;
+    }
+    if (!n) return 0;
+    const double t = (double)clock() / CLOCKS_PER_SEC - t0;
+    u16 b = 0;
+    for (int i = 0; i < n; i++) {
+        if (t < ev[i].from || t > ev[i].to + 0.4) continue;
+        double ph = t - ev[i].from;
+        if (ev[i].every > 0) ph -= ev[i].every * (double)(long)(ph / ev[i].every);
+        if (ph < 0.4) {
+            static double last_log = -100;
+            if (t - last_log > 1.0) { last_log = t; fprintf(stderr, "[mm-autopad] t=%.0fs press 0x%04X\n", t, ev[i].btn); }
+            b |= ev[i].btn;
+        }
+    }
+    return b;
+}
+
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
@@ -308,6 +357,9 @@ static void pad_poll_keyboard(void)
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
+    { const u16 ab = mm_autopad_buttons();
+      if (ab) { hs->buttons = ab; hs->connected = 1; hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+                hs->trigger_l2 = hs->trigger_r2 = 0; return; } }
     if (!pad_host_window_focused()) {
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
@@ -793,7 +845,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    if (!s_host_state[0].connected || mm_autopad_buttons()) pad_poll_keyboard();   /* MM: autopad overrides a connected pad */
     pad_track_assign();
     pad_unlock();
 }

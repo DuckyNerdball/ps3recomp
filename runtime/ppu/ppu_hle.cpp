@@ -281,8 +281,10 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
-    if (const hle_fast_fn f = hle_fast(nid))
+    if (const hle_fast_fn f = hle_fast(nid)) {
+        if (ctx) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);   /* multi-TOC: caller reloads r2 from 0x28(r1) */
         if (f(ctx)) return;
+    }
 
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
@@ -676,7 +678,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * draws. Isolating r1 to a fresh slice keeps the caller frame intact.
              * Opt out with YDKJ_NO_REENTRY_ISO=1. */
             { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
-              if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
+              if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull; /* MM: carry stack-passed args 9+ (and the r3-r10 save area) to the new frame */ memcpy(vm_base + (uint32_t)ctx->gpr[1] + 0x30, vm_base + (uint32_t)_sr1 + 0x30, 0xD0);
                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
             /* A real PRX serving this import is a different implementation of it,

@@ -22,7 +22,7 @@ extern "C" {
 #define SYS_MEMORY_PAGE_SIZE_64K  0x200
 
 /* Maximum tracked allocations */
-#define SYS_MEMORY_ALLOC_MAX      1024
+#define SYS_MEMORY_ALLOC_MAX      4096   /* MM: 1024 ran out at ~1024 live 64 KB chunks (77 MB) -> game OOM in level load */
 #define SYS_MEMORY_CONTAINER_MAX  16
 #define SYS_MMAPPER_SHARED_MAX    64
 

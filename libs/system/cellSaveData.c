@@ -674,6 +674,8 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     case CELL_SAVEDATA_FILETYPE_NORMALFILE: break;
     default: return CELL_SAVEDATA_ERROR_PARAM;
     }
+    /* MM: a write of nothing (the title had no data to give) is a no-op, not an error */
+    if ((set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE || set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC) && !set->fileBuf && set->fileSize == 0) return 0;
     if (!name || !name[0] || strnlen(name, CELL_SAVEDATA_FILENAME_SIZE) == CELL_SAVEDATA_FILENAME_SIZE ||
         strchr(name, '/') || strchr(name, '\\') || !strcmp(name, ".") || !strcmp(name, "..") ||
         (set->fileOperation != CELL_SAVEDATA_FILEOP_DELETE && !set->fileBuf))

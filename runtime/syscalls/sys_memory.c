@@ -114,6 +114,7 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
     uint32_t size = (uint32_t)rounded;
     bump_lock();
     if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) ENOMEM: used 0x%X of 0x%X\n", size, (unsigned)s_total_allocated, (unsigned)SYS_MEM_USER_TOTAL);
         bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
     }
     sys_mem_container_info* ct = NULL;
@@ -128,6 +129,7 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
     uint32_t addr = slot < 0 ? 0 : user_address(size, alignment);
     if (!addr || vm_commit(addr, size) != CELL_OK) {
+        fprintf(stderr, "[sys_memory] allocate(size=0x%X) ENOMEM: no address range (slot %d, used 0x%X)\n", size, slot, (unsigned)s_total_allocated);
         bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
     }
     memset(vm_to_host(addr), 0, size);
@@ -138,7 +140,7 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
     if (ct) ct->used_size += size;
     if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
     bump_unlock();
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
+    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X used=0x%X\n", size, flags, cid, addr, (unsigned)s_total_allocated);
     if (addr_out) write_be32(addr_out, addr);
     return CELL_OK;
 }
@@ -184,6 +186,7 @@ int64_t sys_memory_free(ppu_context* ctx)
             if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active)
                 g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
+            fprintf(stderr, "[sys_memory] free 0x%08X size=0x%X used=0x%X\n", addr, g_sys_mem_allocs[i].size, (unsigned)s_total_allocated);
             bump_unlock(); return CELL_OK;
         }
     }

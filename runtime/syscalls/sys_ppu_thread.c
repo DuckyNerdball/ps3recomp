@@ -198,6 +198,9 @@ static void* ppu_host_thread_proc(void* param)
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
     ps3_tprof_thread('P', (uint32_t)info->ctx.thread_id);
 
+    /* PS3_SAMPLE_GTID=<guest tid>: publish that thread's host tid for the sampler. */
+    { extern volatile unsigned long g_mm_samp_spu_tid; const char* e = getenv("PS3_SAMPLE_GTID");
+      if (e && ((e[0] == '0' && e[1] == 'x') ? strtoull(e, 0, 16) == (unsigned long long)info->entry_addr : (unsigned long long)atoll(e) == (unsigned long long)info->ctx.thread_id)) g_mm_samp_spu_tid = GetCurrentThreadId(); }
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());

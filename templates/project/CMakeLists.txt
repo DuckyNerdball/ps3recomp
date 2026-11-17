@@ -172,6 +172,9 @@ elseif(PORT_ENABLE_SPU)
     endif()
 endif()
 
+file(GLOB MM_PM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/spu_pm/*.c")
+list(APPEND SPU_SOURCES ${MM_PM_SOURCES})
+
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
@@ -291,6 +294,14 @@ else()
         COMPILE_OPTIONS "-w;-ffp-contract=off")
 endif()
 
+# MM: the guest main thread runs on the process main thread on Windows, which
+# gets the linker default 1 MB stack while every other guest thread gets 256 MB.
+# UE3 script/virtual-call recursion during a level load overflows 1 MB
+# (host frames are far larger than guest frames). Reserve 256 MB, committed lazily.
+if(WIN32)
+    target_link_options(${PROJECT_NAME} PRIVATE "/STACK:268435456")
+endif()
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
@@ -310,7 +321,10 @@ install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
 #   ./MyGameRecomp_window [--title T] [--size WxH] -- ./MyGameRecomp <args>
 if(APPLE)
     enable_language(OBJC)
-    add_executable(${PROJECT_NAME}_window "${PS3RECOMP_DIR}/tools/host_window/host_window.m")
+    file(GLOB MM_PM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/spu_pm/*.c")
+list(APPEND SPU_SOURCES ${MM_PM_SOURCES})
+
+add_executable(${PROJECT_NAME}_window "${PS3RECOMP_DIR}/tools/host_window/host_window.m")
     target_include_directories(${PROJECT_NAME}_window PRIVATE "${PS3RECOMP_DIR}/libs/video")
     target_compile_definitions(${PROJECT_NAME}_window PRIVATE HOST_WINDOW_TITLE="${PROJECT_NAME}")
     target_compile_options(${PROJECT_NAME}_window PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter)

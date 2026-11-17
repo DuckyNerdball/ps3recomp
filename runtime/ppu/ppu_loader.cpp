@@ -651,6 +651,9 @@ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
  * these RVAs from the linker map (scripts/gow1hd.py symbolize does the
  * parsing) attributes guest and runtime code exactly. */
 static FILE*     s_samp_rva_file;
+static int       s_samp_sputask;
+extern "C" volatile unsigned long g_mm_samp_spu_tid;
+extern "C" { volatile unsigned long g_mm_samp_spu_tid; }
 static uint32_t* s_samp_rvas;
 static uint32_t  s_samp_rva_n, s_samp_rva_cap;
 static void samp_rva_record(uintptr_t rip)
@@ -701,6 +704,13 @@ static DWORD WINAPI samp_thread(LPVOID p)
         ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
     DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
     for (;;) {
+        /* PS3_SAMPLE_SPUTASK=1 (+ MM_TASKLOG=<task image>): sample only the
+         * SPU host thread that last ran that task. */
+        if (s_samp_sputask && g_mm_samp_spu_tid && g_mm_samp_spu_tid != one_tid) {
+            if (main_h) CloseHandle(main_h);
+            one_tid = (DWORD)g_mm_samp_spu_tid;
+            main_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, one_tid);
+        }
         if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
             if (main_h) CloseHandle(main_h);
             one_tid = (DWORD)g_gcm_drain_tid;
@@ -717,6 +727,20 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(one_tid);
                              samp_tid2(one_tid, 1, 0); }
                     else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                           /* SPU-task mode: a wait in ntdll is credited to the
+                            * first return address into the exe on its stack, so
+                            * the rva list names who is waiting. */
+                           if (nt && s_samp_sputask) {
+                               static uintptr_t xb, xe;
+                               if (!xb) { xb = (uintptr_t)GetModuleHandleA(NULL);
+                                   const IMAGE_NT_HEADERS* nh = (const IMAGE_NT_HEADERS*)(xb + ((const IMAGE_DOS_HEADER*)xb)->e_lfanew);
+                                   xe = xb + nh->OptionalHeader.SizeOfImage; }
+                               const uintptr_t* sp = (const uintptr_t*)c.Rsp;
+                               for (int k = 0; k < 256; k++) { uintptr_t v;
+                                   if (!ReadProcessMemory(GetCurrentProcess(), sp + k, &v, sizeof v, NULL)) break;
+                                   DWORD64 ib = 0;
+                                   if (v > xb + 0x1000 && v < xe && RtlLookupFunctionEntry((DWORD64)v, &ib, NULL)) { samp_rva_hit(v); break; } }
+                           }
                            if (!nt) samp_rva_hit((uintptr_t)c.Rip);
                            samp_tid2(one_tid, 0, nt); }
                 }
@@ -830,6 +854,7 @@ void ps3_sampler_start(void)
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
     s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
+    s_samp_sputask = (getenv("PS3_SAMPLE_SPUTASK") || getenv("PS3_SAMPLE_GTID")) ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
@@ -951,6 +976,18 @@ extern "C" void ppu_report_guest_lrs(void)
         fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        { static int s_mm = -1; if (s_mm < 0) { const char* e = getenv("MM_REGS"); s_mm = (e && *e) ? 1 : 0; }
+          if (s_mm) {
+              fprintf(stderr, "[MMREG]     tid %-3u", (unsigned)c->thread_id);
+              for (int r = 26; r <= 31; r++) {
+                  const uint32_t v = (uint32_t)c->gpr[r];
+                  fprintf(stderr, " r%d=%08X", r, v);
+                  MEMORY_BASIC_INFORMATION mbi;
+                  if (v >= 0x10000u && VirtualQuery(vm_base + v, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                      const uint8_t* p = (const uint8_t*)vm_base + v; fprintf(stderr, "[");
+                      for (int k = 0; k < 24; k += 4) fprintf(stderr, "%s%02X%02X%02X%02X", k ? " " : "", p[k], p[k+1], p[k+2], p[k+3]);
+                      fprintf(stderr, "]"); } }
+              fprintf(stderr, "\n"); } }
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where
@@ -3288,6 +3325,19 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */
+    /* MM_SCTL_TID=<tid>[:<n>]: a timeline of one guest thread's syscalls (num,
+     * first args, microseconds) -- the gaps between entries are where its
+     * cycle actually goes (blocked in the previous call, or computing). */
+    { static int64_t tt=-2, cap=0, tl[4]={-1,-1,-1,-1}; static int n=0;
+      if (tt==-2) { const char* e=getenv("MM_SCTL_TID"); tt=e?(int64_t)strtoll(e,0,0):-1;
+                    /* MM_SCTL_TID=<tid>[,<tid>...][:<n>] (up to 4 threads) */
+                    if (e) { const char* q=e; for (int k=0;k<4&&q&&*q&&*q!=':';k++) { char* d; tl[k]=strtoll(q,&d,0); q=(*d==',')?d+1:0; } }
+                    const char* c=e?strchr(e,':'):0; cap=c?atoll(c+1):400; }
+      const int64_t me=(int64_t)ctx->thread_id;
+      if (tt>=0 && (me==tl[0]||me==tl[1]||me==tl[2]||me==tl[3]) && n<cap) { n++;
+        extern unsigned long long ps3_qpc_us(void);
+        fprintf(stderr,"[SCTL tid%lld] t=%llu sc=%llu r3=%08X r4=%08X r5=%08X lr=0x%08X\n",(long long)me,
+                ps3_qpc_us(),(unsigned long long)num,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->lr); } }
     { static int64_t ws=-2; if(ws==-2){ws=getenv("PS3_SCTRACE_TID")?1:0;}
       if(ws && ctx->thread_id==1){ static int _n=0; if(PS3_LOG_FIRST(_n, 60))
         fprintf(stderr,"[WORKERSC tid1 #%d] syscall %llu r3=%08X r4=%08X r5=%08X r6=%08X\n",

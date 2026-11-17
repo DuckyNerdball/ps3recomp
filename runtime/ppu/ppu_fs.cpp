@@ -78,6 +78,7 @@ extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
+extern "C" uint64_t vm_read64(uint64_t a);
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
@@ -480,6 +481,13 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
     p[len - 1] = p[len - 1];
 }
 
+/* MM_WATCH=<hexEA>: report any write path covering EA..EA+0x20 (memory-corruption hunt). */
+static int mm_watch_hits(unsigned ea, unsigned long long size)
+{
+    static int init = 0; static unsigned w = 0;
+    if (!init) { const char* e = getenv("MM_WATCH"); w = e ? (unsigned)strtoul(e, 0, 16) : 0; init = 1; }
+    return w && (unsigned long long)ea < (unsigned long long)w + 0x20u && (unsigned long long)ea + size > w;
+}
 static void cellFsRead(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -493,6 +501,7 @@ static void cellFsRead(ppu_context* ctx)
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     fs_set_dir(fd, f, 1);
+    if (mm_watch_hits(buf, nbytes)) fprintf(stderr, "[mm-watch] cellFsRead fd=%d buf=0x%08X n=0x%llX tid=%llu\n", fd, buf, (unsigned long long)nbytes, (unsigned long long)ctx->thread_id);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
@@ -930,7 +939,32 @@ static void cellFsGetFreeSize(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
-static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
+/* MM: real cellFsUtime. UE3 marks a finished HDD-cache copy by stamping the
+ * <file>__time marker with the disc file's time and compares the two on the next
+ * boot; the old no-op stub made every boot re-copy the whole cache. */
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
+static void cellFsUtime(ppu_context* ctx)
+{
+    char gpath[1024], hpath[1100];
+    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+    const uint32_t tb = (uint32_t)ctx->gpr[4];
+    host_path(hpath, sizeof hpath, gpath);
+    if (!tb) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+    const int64_t at = (int64_t)vm_read64(tb), mt = (int64_t)vm_read64(tb + 8);
+#ifdef _WIN32
+    struct __utimbuf64 ub; ub.actime = at; ub.modtime = mt;
+    const int rc = _utime64(hpath, &ub);
+#else
+    struct utimbuf ub; ub.actime = (time_t)at; ub.modtime = (time_t)mt;
+    const int rc = utime(hpath, &ub);
+#endif
+    static int n; if (n < 6) { n++; fprintf(stderr, "[fs] utime '%s' mtime=%lld -> %s\n", gpath, (long long)mt, rc == 0 ? "OK" : "ENOENT"); }
+    ctx->gpr[3] = rc == 0 ? CELL_OK : (uint64_t)(int64_t)CELL_FS_ENOENT;
+}
 /* SDATA opened from an already-open fd is not implemented: fail visibly rather
  * than return CELL_OK with *sdata_fd never written. */
 static void cellFsSdataOpenByFd(ppu_context* ctx)

@@ -128,7 +128,9 @@ typedef struct {
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
+    u64                  last_mix_us;    /* guest system time when block read_index-1 was mixed */
 } AudioPortSlot;
+extern uint64_t ps3_guest_system_time_us(void);   /* runtime/ppu/ppu_sysprx.cpp */
 
 static int            s_audio_initialized = 0;
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
@@ -160,6 +162,33 @@ static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+/* MM: master volume (MM_VOLUME=0..1, default 1; 0 = mute) and a hard clamp to
+ * [-1,1] -- an out-of-range mix must never reach the speakers at full scale. */
+static void mm_audio_post(float* b, u32 frames)
+{
+    static float vol = -1.0f;
+    if (vol < 0.0f) { const char* e = getenv("MM_VOLUME"); vol = e ? (float)atof(e) : 1.0f;
+                      if (vol < 0.0f) vol = 0.0f; if (vol > 1.0f) vol = 1.0f; }
+    /* MM_AUDIO_METER=1: final stereo mix before MM_VOLUME -- RMS, peak, and how
+     * many samples would clip at full volume, every ~5 s. */
+    { static int mon = -1; if (mon < 0) mon = getenv("MM_AUDIO_METER") ? 1 : 0;
+      if (mon) { static double ss; static float pk; static u64 n, clip;
+        for (u32 i = 0; i < frames * 2u; i++) { const float a = fabsf(b[i]);
+            if (a == a) { ss += (double)a * a; if (a > pk) pk = a; if (a > 1.0f) clip++; } }
+        n += frames * 2u;
+        if (n >= 48000ull * 2 * 5) {
+            const double r = sqrt(ss / (double)n);
+            fprintf(stderr, "[audio-meter] MIX rms %.1f dBFS peak %.1f dBFS clipped %.3f%%\n",
+                    r > 1e-9 ? 20.0 * log10(r) : -180.0, pk > 1e-9f ? 20.0 * log10(pk) : -180.0,
+                    100.0 * (double)clip / (double)n);
+            ss = 0; pk = 0; n = 0; clip = 0; } } }
+    for (u32 i = 0; i < frames * 2u; i++) {
+        float v = b[i] * vol;
+        if (!(v == v)) v = 0.0f;
+        b[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+    }
+}
+
 
 /* ---------------------------------------------------------------------------
  * Host audio output backend
@@ -405,6 +434,16 @@ static int audio_backend_room(void)
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
     }
+    /* MM_AUDIO_QUEUE=<frames>: keep at most this much audio queued at the
+     * device. Filling the whole WASAPI buffer (2880 frames = 60 ms, ~11
+     * blocks) puts the cellAudio reader permanently ~11 blocks ahead of real
+     * time -- more than an 8-block port ring -- so a guest mixer that paces
+     * itself by time (FMOD) writes each block into a slot the reader has
+     * already consumed and cleared: steady ~50% dropouts. */
+    { static int q = -2;
+      if (q == -2) { const char* e = getenv("MM_AUDIO_QUEUE"); q = e ? atoi(e) : 0; if (q < 0) q = 0; }
+      if (q > 0 && (UINT32)q < s_wasapi_buf_frames)
+          return padding >= (UINT32)q ? 0 : (int)((UINT32)q - padding); }
     return (int)(s_wasapi_buf_frames - padding);
 }
 
@@ -467,8 +506,8 @@ static void audio_mix_one_block(void)
 
         u32 nch    = (u32)port->param.nChannel;
         u32 nblock = (u32)port->param.nBlock;
-        float level = port->param.level;
-        if (level <= 0.0f) level = 1.0f;
+        float level = port->param.level;      /* set at PortOpen (INITLEVEL) */
+        if (!(level >= 0.0f)) level = 1.0f;   /* NaN */
         if (level > 1.0f) level = 1.0f;
 
         /* Read one block at the current read_index */
@@ -506,6 +545,23 @@ static void audio_mix_one_block(void)
             prev_nz[p] = nz; } }
 #endif
 
+        /* MM_AUDIO_METER=1: per-port, per-channel RMS (dBFS) every ~5 s. Shows
+         * which channels carry signal and whether two ports duplicate a mix. */
+        { static int mon = -1; if (mon < 0) mon = getenv("MM_AUDIO_METER") ? 1 : 0;
+          if (mon && p < 4 && nch <= 8) {
+              static double acc[4][8]; static u32 nacc[4];
+              for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
+                  for (u32 c = 0; c < nch; c++) { const double v = ld_be_f32(&src[s * nch + c]); acc[p][c] += v * v; }
+              if (++nacc[p] >= 940) {   /* ~5 s of 256-sample blocks at 48 kHz */
+                  char line[256]; int o = snprintf(line, sizeof line, "[audio-meter] port %d level=%.3f ch dBFS:", p, level);
+                  for (u32 c = 0; c < nch; c++) {
+                      const double r = sqrt(acc[p][c] / ((double)nacc[p] * CELL_AUDIO_BLOCK_SAMPLES));
+                      o += snprintf(line + o, sizeof line - o, " %.1f", r > 1e-9 ? 20.0 * log10(r) : -180.0);
+                      acc[p][c] = 0;
+                  }
+                  nacc[p] = 0; fprintf(stderr, "%s\n", line);
+              } } }
+
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
             if (nch >= 2) {
@@ -516,16 +572,20 @@ static void audio_mix_one_block(void)
                 left = right = ld_be_f32(&src[s]) * level;
             }
 
-            /* If 7.1, mix center and other channels into stereo */
+            /* 7.1 -> stereo: ITU-style Lo = L + 0.707 C + 0.707 Ls, with Ls the
+             * mean of side and rear and LFE dropped, normalised (as ffmpeg's
+             * swresample does) so content present in every speaker sums to at
+             * most unity. The old fold (L + .707C + .5LFE + .5RL + .3SL, no
+             * normalisation) ran ~+5 dB hot: this title's FMOD copies its
+             * stereo music into FL, RL and SL at equal level, so menus mixed at
+             * -9 dBFS RMS with 0 dBFS peaks (MM_AUDIO_METER). */
             if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
+                const float k = 1.0f / (1.0f + 0.7071f + 0.7071f);
+                const float c  = ld_be_f32(&src[s * 8 + 2]) * level * 0.7071f;
+                const float ls = (ld_be_f32(&src[s * 8 + 4]) + ld_be_f32(&src[s * 8 + 6])) * 0.5f * level * 0.7071f;
+                const float rs = (ld_be_f32(&src[s * 8 + 5]) + ld_be_f32(&src[s * 8 + 7])) * 0.5f * level * 0.7071f;
+                left  = (left  + c + ls) * k;
+                right = (right + c + rs) * k;
             }
 
             s_mix_buffer[s * 2 + 0] += left;
@@ -541,8 +601,35 @@ static void audio_mix_one_block(void)
          * ring slot to the guest. SurMixer multiplies this value by the block
          * size directly; an unbounded counter walks beyond the audio buffer. */
         port->read_index++;
-        if (port->read_idx_addr)
-            vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+        port->last_mix_us = ps3_guest_system_time_us();
+        /* MM_RING_TRACE=N: N events of "blocks newly filled since the last
+         * consume" for this port -- the guest mixer's refill trigger, against
+         * our read position and the other port's. */
+        { static int cap = -1, n = 0; static u32 prev_mask[CELL_AUDIO_PORT_MAX];
+          if (cap < 0) { const char* e = getenv("MM_RING_TRACE"); cap = e ? atoi(e) : 0; }
+          if (cap && n < cap && nblock <= 32) {
+              u32 mask = 0;
+              for (u32 b = 0; b < nblock; b++) {
+                  const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                  for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 8) if (bp[s2] != 0.0f) { mask |= 1u << b; break; }
+              }
+              const u32 gained = mask & ~prev_mask[p];
+              if (gained) { n++;
+                  fprintf(stderr, "[ring] port %d t=%llu rpos=%u filled+=0x%02X now=0x%02X | port0 ridx=%llu running=%d\n",
+                          p, (unsigned long long)port->last_mix_us, (u32)(port->read_index % nblock), gained, mask,
+                          (unsigned long long)s_ports[0].read_index, s_ports[0].running); }
+              prev_mask[p] = mask; } }
+        /* MM_AUDIO_LEAD=N (0..nblock-2): report the read position N blocks
+         * ahead of the block actually being played, so the guest's mixer
+         * (which fills a fixed distance ahead of the reported position)
+         * writes each block N periods earlier than it is consumed: N * 5.33 ms
+         * of slack for a producer that is sometimes late, at N * 5.33 ms of
+         * added latency. */
+        { static int lead = -1;
+          if (lead < 0) { const char* e = getenv("MM_AUDIO_LEAD"); lead = e ? atoi(e) : 0; if (lead < 0) lead = 0; }
+          u32 ld = (u32)lead; if (ld + 2 > nblock) ld = nblock > 2 ? nblock - 2 : 0;
+          if (port->read_idx_addr)
+              vm_write64((u32)port->read_idx_addr, (port->read_index + ld) % nblock); }
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -558,6 +645,7 @@ static void audio_mix_one_block(void)
  * Mixing thread
  * -----------------------------------------------------------------------*/
 
+static unsigned long long g_audio_notify_drops, g_audio_notify_sent;
 static void audio_notify_event_queues(void)
 {
     /* Push the audio-period event (data1 = CELL_AUDIO_EVENT_MIX = 0) to each
@@ -567,9 +655,12 @@ static void audio_notify_event_queues(void)
     for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
         if (!s_notify_queues[i].in_use) continue;
         uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
-        if (qid)
-            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
-                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+        if (qid) {
+            if (sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+                                           0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0) != 0)
+                g_audio_notify_drops++;   /* queue full: the guest misses a period */
+            g_audio_notify_sent++;
+        }
     }
 }
 
@@ -651,7 +742,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
         audio_dump_mix();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        mm_audio_post(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES); audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
@@ -667,6 +758,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 #else
                         0u, g_audio_holes[0], g_audio_holes[1], 10);
 #endif
+                { static unsigned long long s0, d0n;
+                  fprintf(stderr, "[audio-rate]   notify events sent %llu, dropped (queue full) %llu%c",
+                          g_audio_notify_sent - s0, g_audio_notify_drops - d0n, 10);
+                  s0 = g_audio_notify_sent; d0n = g_audio_notify_drops; }
                 g_audio_holes[0] = g_audio_holes[1] = 0;
                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
 
@@ -678,6 +773,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -687,7 +783,7 @@ static void* audio_mix_thread_func(void* arg)
     while (s_mix_thread_running) {
         audio_mix_one_block();
         audio_dump_mix();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        mm_audio_post(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES); audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
         /* AUDIO_PEAK=1: the loudest sample of every second of mixed output (187.5 blocks of 256). */
         { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
@@ -836,8 +932,11 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     u64 nch  = vm_read64(param_ea + 0);   /* nChannel */
     u64 nblk = vm_read64(param_ea + 8);   /* nBlock   */
-    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
-           (unsigned long long)nch, (unsigned long long)nblk);
+    /* CellAudioPortParam: u64 nChannel, u64 nBlock, u64 attr, float level (BE). */
+    const u64 pattr = vm_read64(param_ea + 16);
+    float plevel; { const u32 lw = vm_read32(param_ea + 24); memcpy(&plevel, &lw, 4); }
+    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu, attr=0x%llX, level=%g)\n",
+           (unsigned long long)nch, (unsigned long long)nblk, (unsigned long long)pattr, plevel);
 
     if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
         return CELL_AUDIO_ERROR_PARAM;
@@ -867,6 +966,10 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     memset(&port->param, 0, sizeof(port->param));
     port->param.nChannel = nch;
     port->param.nBlock   = nblk;
+    /* CELL_AUDIO_PORTATTR_INITLEVEL (0x1000): the port starts at `level`;
+     * without it the firmware default is 1.0. Previously never read. */
+    port->param.attr     = pattr;
+    port->param.level    = (pattr & 0x1000ull) ? plevel : 1.0f;
     port->read_index  = 0;
     port->write_index = 0;
 
@@ -1012,11 +1115,30 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
 
     mutex_lock(&s_audio_mutex);
     u64 global_counter = s_ports[portNum].read_index;
+    u64 last_mix = s_ports[portNum].last_mix_us;
     mutex_unlock(&s_audio_mutex);
     if (tag > global_counter)
         return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
 
-    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    /* The time the block with this tag was mixed, on the guest's system clock
+     * (sys_time_get_system_time), as on hardware / RPCS3: the port's last mix
+     * time minus one period per block since. The old formula anchored at
+     * cellAudioInit on the raw host QPC clock -- microseconds since Windows
+     * booted -- so a mixer comparing stamps with its own clock (FMOD) was off
+     * by the machine's uptime and fell back to refilling its 8-block ring
+     * every OTHER cycle: 8 blocks of sound, 8 of silence, ~47% dropouts.
+     * MM_AUDIO_TS_LEGACY=1 restores the old formula. */
+    static int legacy = -1;
+    if (legacy < 0) { const char* e = getenv("MM_AUDIO_TS_LEGACY"); legacy = (e && e[0] == '1'); }
+    u64 t;
+    if (legacy)
+        t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    else if (!last_mix)
+        t = ps3_guest_system_time_us();
+    else {
+        const u64 back = (global_counter - tag) * 256000000ULL / 48000ULL;
+        t = last_mix > back ? last_mix - back : 0;
+    }
     vm_write64(stamp_ea, t);
     return CELL_OK;
 }

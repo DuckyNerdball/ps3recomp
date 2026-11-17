@@ -1752,6 +1752,15 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
             ReleaseSRWLockExclusive(&s_spu_port_lock);
         }
         result = CELL_ENOTCONN;
+        /* MM_PORTLOG=<queue>: time, sender image/pc of every SPU event sent
+         * to that queue (pair with MM_SCTL_TID for the receiver side). */
+        { static int s_pq = -2; static int s_pn = 0;
+          if (s_pq == -2) { const char* e = getenv("MM_PORTLOG"); s_pq = e ? atoi(e) : 0; }
+          if (s_pq && (int)queue == s_pq && s_pn++ < 3000) {
+              extern unsigned long long ps3_qpc_us(void);
+              fprintf(stderr, "[PORTLOG] t=%llu q=%u port=0x%X spu=0x%X img=%d pc=0x%05X ovl=%d task=%d d=0x%X/0x%X\n",
+                      ps3_qpc_us(), queue, port, spu->spu_id, spu->image_id, (unsigned)(spu->pc & 0x3FFFF),
+                      (int)spu->resident_ovl, (int)spu->resident_task, value & 0xFFFFFFu, data); } }
         if (queue) {
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
