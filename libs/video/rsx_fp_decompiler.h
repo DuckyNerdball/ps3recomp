@@ -131,6 +131,11 @@ int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     char* out, u32 out_size, u32* out_constant_count);
 
+/* Literal-constant decompile with per-unit sRGB decode on fetch
+ * (rsx_texture_gamma_mask lanes). gamma_masks may be NULL. */
+int rsx_fp_decompile_gamma_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+                              const u8 gamma_masks[16], char* out, u32 out_size);
+
 /* Native depth texture comparison metadata. Disabled descriptors preserve the
  * original shader byte-for-byte. enabled=2 marks an active unsupported layout.
  * RSX ADDRESS zfunc0/7 and texture alpha-kill bypass comparison; modes1..6

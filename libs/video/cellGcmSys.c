@@ -1665,6 +1665,15 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
             const u32 at = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
+            /* MM_INLINE_LOG=<n>[:<lo>-<hi>]: inline-transfer words landing in the
+             * local-offset window (default the whole space) -- fragment-program
+             * constant patches (cellGcmSetFragmentProgramParameter). */
+            { static int cap = -1, n = 0; static u32 lo = 0, hi = 0xFFFFFFFFu;
+              if (cap < 0) { const char* e = getenv("MM_INLINE_LOG"); cap = e ? atoi(e) : 0;
+                             const char* c = e ? strchr(e, ':') : NULL;
+                             if (c) { lo = (u32)strtoul(c + 1, (char**)&c, 16); if (*c == '-') hi = (u32)strtoul(c + 1, NULL, 16); } }
+              if (cap && n < cap && local && at >= lo && at <= hi) { n++;
+                  fprintf(stderr, "[INLINE] off=0x%08X = 0x%08X%c", at, data, 10); } }
             if (gcm_rect_tiled(local, at, 4, 1)) {
                 const u8 word[4] = { (u8)(data >> 24), (u8)(data >> 16), (u8)(data >> 8), (u8)data };
                 rsx_tiled_write(&s_gcm_mem, RSX_LOCATION_MAIN, at, word, 4);

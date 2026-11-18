@@ -71,9 +71,14 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
-/* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_k[64]
- * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
-#define VP_FPCB_STRIDE    1280
+/* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_constants[FPK_MAX]
+ * + fp_alpha = 256 float4 = 4096 B (a multiple of D3D12's 256-byte CBV
+ * alignment). Programs with more inline constants than FPK_MAX fall back to
+ * literal constants and a pipeline key that includes them. */
+#define FPK_MAX           250
+#define FPK_BASE          20                        /* float index of fp_constants[0] */
+#define FPK_ALPHA         (FPK_BASE + FPK_MAX * 4)  /* float index of fp_alpha */
+#define VP_FPCB_STRIDE    4096
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -2314,6 +2319,22 @@ static u32 dr_unnorm_units(const D3D12DrawRecord* dr, u32 dim[16][3])
     return mask;
 }
 
+/* Per-unit sRGB-decode lanes for the draw about to fetch its pipeline
+ * (TEXTURE_ADDRESS gamma bits via rsx_texture_gamma_mask). RSX converts those
+ * lanes sRGB->linear on fetch; UE3's UI/scene shaders then re-encode with
+ * pow(x, 1/2.2). Without the decode every such texture is gamma-encoded twice
+ * (lifted blacks, washed-out menus). Set by fp_gamma_from_dr() before each
+ * vp_get_fp_pso call; MM_NO_TEXGAMMA=1 disables (A/B). */
+static u8 s_fp_gamma[16];
+static void fp_gamma_from_dr(const D3D12DrawRecord* dr)
+{
+    static int off = -1; if (off < 0) off = getenv("MM_NO_TEXGAMMA") ? 1 : 0;
+    for (int u = 0; u < 16; u++)
+        s_fp_gamma[u] = (!off && dr && dr->tex[u].set)
+            ? rsx_texture_gamma_mask(dr->tex[u].fmt, dr->tex[u].ctrl1, dr->tex[u].filter, dr->tex[u].addr)
+            : 0;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, u32 unnorm_mask, const u32 unnorm_dim[16][3], u64 zs)
@@ -2344,6 +2365,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * constant buffer the compiled shader is invariant under constant changes,
      * so hashing them made the pipeline key move every draw. */
     u32 uhash;
+    /* Buffered (fp_constants[] in b1, refilled per draw) unless FP_CONSTBUF=0 or
+     * the program has more inline constants than the b1 slot holds. A literal
+     * program bakes its constants, so its key must include them. */
+    int fp_buffered;
     {
         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
         if (usz == 0) usz = 64;
@@ -2351,12 +2376,22 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         static int consts_inline = -1;
         if (consts_inline < 0) { const char* e = getenv("FP_CONSTBUF");
                                  consts_inline = (e && e[0] == '0') ? 1 : 0; }
-        if (consts_inline) {
+        static rsx_fp_constant_block kb;
+        const int nk = consts_inline ? -1 : rsx_fp_collect_constants(vm_base + off, 4096, &kb);
+        fp_buffered = (nk >= 0 && nk <= FPK_MAX);
+        if (!fp_buffered) {
             uhash = 2166136261u;
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
         } else {
             uhash = rsx_fp_code_hash(vm_base + off, 4096);
+        }
+        /* Only units this program samples count, so a stray gamma bit on an
+         * unused unit does not split the pipeline cache. */
+        const u32 gu = rsx_fp_texture_gamma_units(vm_base + off, 4096, s_fp_gamma);
+        for (int u = 0; u < 16; u++) {
+            if (!(gu & (1u << u))) s_fp_gamma[u] = 0;
+            if (s_fp_gamma[u]) { uhash ^= (u32)(s_fp_gamma[u] | (u << 4)) * 0x9E3779B1u; uhash *= 16777619u; }
         }
     }
 
@@ -2441,7 +2476,33 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
-    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
+    int n;
+    if (fp_buffered) {
+        u32 nk = 0;
+        n = rsx_fp_decompile_buffered_shadow_color_ex(vm_base + off, 4096, fp_ctrl, 0, NULL,
+                                                      s_fp_gamma, hlsl, sizeof(hlsl), &nk);
+        /* The decompiler sizes fp_constants[] to the program, which would move
+         * fp_alpha; pin the b1 layout vp_record_cb fills instead. */
+        if (n > 0) {
+            char* a = strstr(hlsl, "cbuffer PSConstants : register(b1) {");
+            char* e = a ? strstr(a, "};\n") : NULL;
+            if (!e) n = -1;
+            else {
+                char decl[256];
+                const int dl = snprintf(decl, sizeof decl,
+                    "cbuffer PSConstants : register(b1) {\n"
+                    "    float4 rsx_texscale[4];\n    float4 rsx_alphatest;\n"
+                    "    float4 fp_constants[%d];\n    float4 fp_alpha;\n};\n", FPK_MAX);
+                e += 3;
+                const size_t old = (size_t)(e - a), tail = strlen(e) + 1;
+                if ((size_t)(a - hlsl) + (size_t)dl + tail > sizeof(hlsl)) n = -1;
+                else { memmove(a + dl, e, tail); memcpy(a, decl, (size_t)dl); }
+                (void)old;
+            }
+        }
+    } else {
+        n = rsx_fp_decompile_gamma_ex(vm_base + off, 4096, fp_ctrl, s_fp_gamma, hlsl, sizeof(hlsl));
+    }
     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
     if (unnorm_mask) {
         rsx_fp_apply_unnorm_scale(hlsl, sizeof(hlsl), unnorm_mask, (const u32 (*)[3])unnorm_dim, cube_mask, 0);
@@ -3546,8 +3607,27 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             extern u32 cellGcmResolveLocated(int, u32);
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
-            if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
+            /* Same slot order as the buffered decompile (rsx_fp_collect_constants):
+             * fp_constants[i] = the i-th inline constant AS PATCHED NOW, at record
+             * time. The pipeline is keyed on the code only, so the shader must
+             * read these rather than bake whichever values it was first compiled
+             * with (UE3 reuses one clear-quad program for alpha 0 and alpha 1). */
+            if (vm_base && foff != 0xFFFFFFFFu) {
+                static rsx_fp_constant_block kb;
+                const int nk = rsx_fp_collect_constants(vm_base + foff, 4096, &kb);
+                if (nk > 0 && nk <= FPK_MAX)
+                    memcpy(&ts[FPK_BASE], kb.values, (size_t)nk * 16u);
+            }
+            ts[FPK_ALPHA + 0] = ts[FPK_ALPHA + 1] = ts[FPK_ALPHA + 2] = ts[FPK_ALPHA + 3] = 0.0f;
+            /* MM_BGQ_DBG=N: record-time K0 of untextured 6-vertex quads (UE3's
+             * clear-colour quad) -- what alpha the scene clear really writes. */
+            { static int cap = -1, n = 0;
+              if (cap < 0) { const char* e = getenv("MM_BGQ_DBG"); cap = e ? atoi(e) : 0; }
+              const u32 nv = dr->indexed ? dr->index_count : dr->vertex_count;
+              if (cap && n < cap && nv == 6 && (dr->rt_fmt & 0x1Fu) == 0x0Bu) { n++;
+                  fprintf(stderr, "[BGQ] fp=0x%08X k0=(%g %g %g %g) cmask=0x%X rt=0x%08X fmt=0x%X vp=%u,%u %ux%u zs=0x%llX%c",
+                          dr->fp_addr, ts[20], ts[21], ts[22], ts[23], dr->cmask, dr->rt_off, dr->rt_fmt,
+                          dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, (unsigned long long)dr->zs_key, 10); } }
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
@@ -5488,6 +5568,22 @@ static void render_frame(void)
                         continue;
                     }
                     dr->tex_rt[_u] = rt;
+                    /* MM_RTTEX_DBG=N: how the guest samples a render target --
+                     * its texture format + TEXTURE_CONTROL1 remap vs the RT's
+                     * own format (distinct (raw, fmt, remap) combos, first N). */
+                    { static int cap = -1, n = 0;
+                      if (cap < 0) { const char* e = getenv("MM_RTTEX_DBG"); cap = e ? atoi(e) : 0; }
+                      if (cap && n < cap) {
+                          static u32 seen[64][3]; static int ns = 0; int f = 0;
+                          for (int q = 0; q < ns; q++)
+                              if (seen[q][0] == dr->tex[_u].raw && seen[q][1] == dr->tex[_u].fmt &&
+                                  seen[q][2] == dr->tex[_u].ctrl1) f = 1;
+                          if (!f && ns < 64) { seen[ns][0] = dr->tex[_u].raw; seen[ns][1] = dr->tex[_u].fmt;
+                              seen[ns][2] = dr->tex[_u].ctrl1; ns++; n++;
+                              fprintf(stderr, "[RTTEX] unit=%d raw=0x%08X fmt=0x%02X ctrl1=0x%08X tex %ux%u | rt %ux%u dxgi=%u fp=0x%X%c",
+                                      _u, dr->tex[_u].raw, dr->tex[_u].fmt, dr->tex[_u].ctrl1, dr->tex[_u].w,
+                                      dr->tex[_u].h, s_d3d.off_rt[rt].w, s_d3d.off_rt[rt].h,
+                                      s_d3d.off_rt[rt].dxgi, dr->fp_addr, 10); } } }
                     srv_write(wslot, s_d3d.off_rt[rt].res, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
@@ -5538,6 +5634,7 @@ static void render_frame(void)
         double _ps0 = perf_on() ? perf_now() : 0.0;
         u32 unnorm_dim[16][3];
         u32 unnorm_mask = dr_unnorm_units(dr, unnorm_dim);
+        fp_gamma_from_dr(dr);
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
@@ -5933,6 +6030,7 @@ static void render_frame(void)
                   const u32 nv = dr->indexed ? dr->index_count : dr->vertex_count;
                   if (bg && nv == 6 && !dr->tex[0].set && (dr->rt_fmt & 0x1Fu) == 0x0Bu)
                       dr_cmask &= 7u; }
+                fp_gamma_from_dr(dr);
                 ID3D12PipelineState* dpso =
                     dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                                 dr_num_rts(dr),
