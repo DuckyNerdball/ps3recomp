@@ -350,6 +350,84 @@ static u16 mm_autopad_buttons(void)
     return b;
 }
 
+/* MM_AUTOPAD_FUZZ=<seed>: seeded random play for the soak harness. Starts only
+ * once gameplay is live -- the renderer has drawn >= MM_FUZZ_LIVE_DRAWS
+ * (default 400) per frame for 5 s straight (menus, the comic intro and loading
+ * stay well below) -- and is a pure function of (seed, 100 ms step since live),
+ * so the same seed replays the same input sequence whatever the poll rate:
+ *   left stick: one of 8 directions or idle, held 0.5-2 s;
+ *   right stick: fire in a random direction about half the time;
+ *   SQUARE ~20% / CROSS ~6% / L1, R1 ~2% / TRIANGLE ~2% / CIRCLE ~1% of steps;
+ *   once per 40 s window, START, then START again 1-3 s later, with nothing
+ *   else pressed in between (so the pause menu is never navigated). */
+extern volatile u32 g_mm_last_draws;
+static u64 mm_fz_mix(u64 x)
+{
+    x += 0x9E3779B97F4A7C15ull; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull; return x ^ (x >> 31);
+}
+static u64 mm_fz_h(u64 seed, u64 step, u64 chan) { return mm_fz_mix(mm_fz_mix(seed) ^ (step * 64u + chan)); }
+static void mm_fz_dir(u64 h, u8* x, u8* y)
+{
+    static const signed char dx[8] = { 127, 90, 0, -90, -127, -90, 0, 90 };
+    static const signed char dy[8] = { 0, 90, 127, 90, 0, -90, -127, -90 };
+    const int d = (int)(h % 8u); *x = (u8)(128 + dx[d]); *y = (u8)(128 + dy[d]);
+}
+static int mm_fuzz_fill(PadHostState* hs)
+{
+    static int on = -1; static u64 seed; static u32 live_draws = 400;
+    static unsigned long long above_since, live_at;
+    if (on < 0) { const char* e = getenv("MM_AUTOPAD_FUZZ"); on = e ? 1 : 0; seed = e ? strtoull(e, 0, 0) : 0;
+                  const char* d = getenv("MM_FUZZ_LIVE_DRAWS"); if (d) live_draws = (u32)atoi(d); }
+    if (!on) return 0;
+    const unsigned long long now = pad_now_ms();
+    if (!live_at) {
+        if (g_mm_last_draws >= live_draws) { if (!above_since) above_since = now; }
+        else above_since = 0;
+        if (!above_since || now - above_since < 5000) return 0;
+        live_at = now;
+        fprintf(stderr, "[mm-fuzz] gameplay live (draws %u) -- fuzz seed %llu starts\n",
+                g_mm_last_draws, (unsigned long long)seed);
+    }
+    const u64 step = (now - live_at) / 100u;
+    pad_host_release(hs); hs->connected = 1;
+    /* pause window */
+    const u64 cyc = step / 400u, base = cyc * 400u;
+    const u64 p1 = base + 100u + mm_fz_h(seed, cyc, 60) % 250u;
+    const u64 p2 = p1 + 10u + mm_fz_h(seed, cyc, 61) % 21u;
+    if (step >= p1 && step <= p2 + 2u) {
+        if (step < p1 + 2u || step >= p2) hs->buttons = CELL_PAD_CTRL_START;
+        { static u64 logged = ~0ull; if (step == p1 && logged != cyc) { logged = cyc;
+            fprintf(stderr, "[mm-fuzz] pause at +%.1fs, resume at +%.1fs\n", p1 / 10.0, p2 / 10.0); } }
+        return 1;
+    }
+    /* left stick: segments of 5..20 steps, walked deterministically */
+    { static u64 s = 0, k = 0, len = 0;   /* step only grows: walk the segments forward */
+      if (!len) len = 5u + mm_fz_h(seed, 0, 1) % 16u;
+      /* segment boundaries are a function of the index only; find the one holding `step` */
+      while (s + len <= step) { s += len; k++; len = 5u + mm_fz_h(seed, k, 1) % 16u; }
+      const u64 h = mm_fz_h(seed, k, 2);
+      if (h % 9u) mm_fz_dir(h / 9u, &hs->analog_lx, &hs->analog_ly); }
+    { const u64 h = mm_fz_h(seed, step / 5u, 3);           /* right stick held 0.5 s */
+      if (h & 1u) mm_fz_dir(h >> 1, &hs->analog_rx, &hs->analog_ry); }
+    const u64 r = mm_fz_h(seed, step, 4) % 1000u;
+    u16 b = 0;
+    if (r < 200) b |= CELL_PAD_CTRL_SQUARE;
+    else if (r < 260) b |= CELL_PAD_CTRL_CROSS;
+    else if (r < 280) b |= CELL_PAD_CTRL_L1;
+    else if (r < 300) b |= CELL_PAD_CTRL_R1;
+    else if (r < 320) b |= CELL_PAD_CTRL_TRIANGLE;
+    else if (r < 330) b |= CELL_PAD_CTRL_CIRCLE;
+    hs->buttons = b;
+    if (b & CELL_PAD_CTRL_SQUARE) hs->press_square = 255;
+    if (b & CELL_PAD_CTRL_CROSS) hs->press_cross = 255;
+    if (b & CELL_PAD_CTRL_TRIANGLE) hs->press_triangle = 255;
+    if (b & CELL_PAD_CTRL_CIRCLE) hs->press_circle = 255;
+    if (b & CELL_PAD_CTRL_L1) hs->press_l1 = 255;
+    if (b & CELL_PAD_CTRL_R1) hs->press_r1 = 255;
+    return 1;
+}
+
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
@@ -357,6 +435,7 @@ static void pad_poll_keyboard(void)
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
+    if (mm_fuzz_fill(hs)) return;
     { const u16 ab = mm_autopad_buttons();
       if (ab) { hs->buttons = ab; hs->connected = 1; hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
                 hs->trigger_l2 = hs->trigger_r2 = 0; return; } }
@@ -845,7 +924,30 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-    if (!s_host_state[0].connected || mm_autopad_buttons()) pad_poll_keyboard();   /* MM: autopad overrides a connected pad */
+    /* Controllers count only while a window of this process has focus, like
+     * the keyboard. XInput/SDL report pads whatever window is in front, so
+     * using the pad in another program drove the game behind it (skipped the
+     * level-intro movie, paused gameplay). Pads stay connected, just neutral.
+     * PAD_BACKGROUND=1 keeps background input. MM_AUTOPAD is unaffected. */
+    { static int bg = -1; if (bg < 0) bg = getenv("PAD_BACKGROUND") ? 1 : 0;
+      if (!bg && !pad_host_window_focused())
+          for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
+              if (s_host_state[_i].connected) { pad_host_release(&s_host_state[_i]); s_host_state[_i].connected = 1; } }
+    const int _xi0 = s_host_state[0].connected;
+    { static int fz = -1; if (fz < 0) fz = getenv("MM_AUTOPAD_FUZZ") ? 1 : 0;
+      /* MM: autopad / fuzz override a connected pad */
+      if (!s_host_state[0].connected || fz || mm_autopad_buttons()) pad_poll_keyboard(); }
+    /* MM_PADLOG=1: every change of a host port's buttons/connection, with the
+     * source (xinput/sdl pad vs keyboard/autopad path) -- spurious input hunt. */
+    { static int lg = -1; if (lg < 0) lg = getenv("MM_PADLOG") ? 1 : 0;
+      if (lg) { static u16 pb[PAD_MAX_HOST_PORTS]; static int pc[PAD_MAX_HOST_PORTS];
+        for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) {
+            const PadHostState* h = &s_host_state[_i];
+            if (h->buttons != pb[_i] || h->connected != pc[_i]) {
+                fprintf(stderr, "[PADLOG] t=%llums port=%d buttons 0x%04X -> 0x%04X conn %d -> %d src=%s focus=%d\n",
+                        now, _i, pb[_i], h->buttons, pc[_i], h->connected,
+                        (_i == 0 && !_xi0) ? "kbd/autopad" : "hostpad", pad_host_window_focused());
+                pb[_i] = h->buttons; pc[_i] = h->connected; } } } }
     pad_track_assign();
     pad_unlock();
 }

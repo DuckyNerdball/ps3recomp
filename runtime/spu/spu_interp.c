@@ -433,7 +433,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         /* Credit an entry inside a resident code region to the image that
          * owns it, so the list names the lift that's missing the entry. */
         uint32_t pc = start_lsa & 0x3FFFC, key = pc; int owner = ctx->image_id;
-        for (unsigned s = 0; s < 4; ++s)
+        for (unsigned s = 0; s < SPU_RESIDENT_SLOTS; ++s)
             if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
                 pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size) {
                 owner = ctx->resident_code[s].image_id;
@@ -497,7 +497,16 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_rejoin_lookup(ctx, ctx->pc))) {
+            /* MM_INTERP_ZERO=N: report the first N interpreter runs that hand back at once
+             * (0 steps) -- a hand-off that can repeat forever without progress. */
+            if (!steps) { static int zn = -1; static volatile long zc;
+                if (zn < 0) { const char* e = getenv("MM_INTERP_ZERO"); zn = e ? atoi(e) : 0; }
+                if (zn && zc < zn) { zc++;
+                    fprintf(stderr, "[interp-zero] img=%d pc=0x%05X start=0x%05X stop=0x%05X lifted=%d depth=%u ovl=%d task=%d spu=0x%X\n",
+                            ctx->image_id, ctx->pc, start_lsa & 0x3FFFC, stop_lsa, spu_lifted_lookup(ctx, ctx->pc) != NULL,
+                            (unsigned)ctx->host_depth, (int)ctx->resident_ovl, (int)ctx->resident_task, ctx->spu_id); } }
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
@@ -571,4 +580,50 @@ void spu_dispatch(spu_context* ctx, uint32_t target) {
         if ((next & 0x3FFFC) == target) return;   /* no-progress guard */
         target = next;
     }
+}
+
+/* Lifted-vs-interpreter shadow check for ONE lifted block (local diagnosis of a mis-lift).
+ * Runs `body` (a lifted function; the caller turns SPU_DIRECT tail calls off so it returns
+ * at its first cross-function branch with ctx->pc = the target), and the interpreter on a
+ * private copy of the context + local store from `entry` until it reaches that same pc.
+ * Reports every differing register and LS range. Only for blocks without channel or MFC
+ * side effects (the copy would repeat them). Returns the number of differences. */
+#include <stdlib.h>
+#include <string.h>
+int spu_shadow_compare(spu_context* ctx, uint32_t entry, void (*body)(spu_context*))
+{
+    spu_context* sh = (spu_context*)malloc(sizeof *sh);
+    if (!sh) { body(ctx); return 0; }
+    memcpy(sh, ctx, sizeof *sh);
+    sh->ls = sh->ls_store;
+    if (ctx->ls != ctx->ls_store) memcpy(sh->ls_store, ctx->ls, SPU_LS_SIZE);
+    const int img0 = ctx->image_id, task0 = (int)ctx->resident_task, ovl0 = (int)ctx->resident_ovl;
+    const unsigned dep0 = (unsigned)ctx->host_depth;
+    body(ctx);
+    const uint32_t exit_pc = ctx->pc & SPU_LS_MASK;
+    { static unsigned long nc; if (nc++ < 12 || img0 != ctx->image_id) { static unsigned long nx; if (nx++ < 40)
+        fprintf(stderr, "[spu-shadow] entry 0x%05X ctx: img %d -> %d, task %d -> %d, ovl %d -> %d, depth %u -> %u, policy %d\n",
+                entry, img0, ctx->image_id, task0, (int)ctx->resident_task, ovl0, (int)ctx->resident_ovl, dep0, (unsigned)ctx->host_depth, (int)ctx->policy_mode); } }
+    sh->pc = entry & SPU_LS_MASK; sh->status = SPU_STATUS_RUNNING;
+    unsigned steps = 0;
+    while ((sh->pc & SPU_LS_MASK) != exit_pc && steps < 100000u) { if (spu_step(sh)) break; steps++; }
+    int nd = 0;
+    if ((sh->pc & SPU_LS_MASK) != exit_pc) {
+        fprintf(stderr, "[spu-shadow] entry 0x%05X: lifted exits at 0x%05X, interpreter at 0x%05X after %u steps\n",
+                entry, exit_pc, sh->pc & SPU_LS_MASK, steps);
+        nd++;
+    }
+    for (int r = 0; r < 128; r++)
+        if (memcmp(&sh->gpr[r], &ctx->gpr[r], 16)) { nd++;
+            fprintf(stderr, "[spu-shadow] entry 0x%05X -> 0x%05X: r%d lifted %08X %08X %08X %08X interp %08X %08X %08X %08X\n",
+                    entry, exit_pc, r, ctx->gpr[r]._u32[0], ctx->gpr[r]._u32[1], ctx->gpr[r]._u32[2], ctx->gpr[r]._u32[3],
+                    sh->gpr[r]._u32[0], sh->gpr[r]._u32[1], sh->gpr[r]._u32[2], sh->gpr[r]._u32[3]); }
+    for (uint32_t a = 0; a < SPU_LS_SIZE; a += 16)
+        if (memcmp(sh->ls + a, ctx->ls + a, 16)) { nd++;
+            fprintf(stderr, "[spu-shadow] entry 0x%05X: LS 0x%05X lifted %02X%02X%02X%02X.. interp %02X%02X%02X%02X..\n",
+                    entry, a, ctx->ls[a], ctx->ls[a+1], ctx->ls[a+2], ctx->ls[a+3], sh->ls[a], sh->ls[a+1], sh->ls[a+2], sh->ls[a+3]); }
+    if (!nd) { static unsigned long ok; if (ok++ < 4) fprintf(stderr, "[spu-shadow] entry 0x%05X -> 0x%05X: identical (%u steps)\n", entry, exit_pc, steps); }
+    fflush(stderr);
+    free(sh);
+    return nd;
 }

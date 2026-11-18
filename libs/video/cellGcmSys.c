@@ -2100,11 +2100,49 @@ unsigned long long ps3_qpc_us(void)
     return (unsigned long long)(n.QuadPart / (f.QuadPart / 1000000));
 }
 
+/* Last published fences (value, QPC us, publisher thread) for the stuck-
+ * waiter report (cellGcm_ref_dump_recent, MM_REFWAIT in sys_timer_usleep). */
+#define GCM_REF_HIST 64
+static u32 s_refh_v[GCM_REF_HIST]; static unsigned long long s_refh_t[GCM_REF_HIST];
+static DWORD s_refh_tid[GCM_REF_HIST]; static volatile u32 s_refh_i;
+void cellGcm_ref_dump_recent(void)
+{
+    const u32 e = s_refh_i;
+    fprintf(stderr, "[REFHIST] now=%lluus ref=0x%08X queued=%u (head %u tail %u)\n", ps3_qpc_us(),
+            vm_read32(GCM_CONTROL_GUEST_ADDR + 8), s_ref_qtail - s_ref_qhead, s_ref_qhead, s_ref_qtail);
+    for (u32 k = (e > GCM_REF_HIST ? e - GCM_REF_HIST : 0); k < e; k++)
+        fprintf(stderr, "[REFHIST]   #%u t=%lluus v=0x%08X host-tid=%lu\n", k, s_refh_t[k % GCM_REF_HIST],
+                s_refh_v[k % GCM_REF_HIST], (unsigned long)s_refh_tid[k % GCM_REF_HIST]);
+    /* Walker side: was the missing fence never put, or put and not walked? */
+    { const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0), get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+      const unsigned long long now = ps3_qpc_us();
+      fprintf(stderr, "[REFHIST] walker getoff=%08X ctrl.put=%08X ctrl.get=%08X park_off=%08X park_put=%08X park_age=%llums"
+              " last_ring=%08X ctx.current=%08X\n", s_fifo_getoff, put, get, park_off, park_put,
+              park_off ? (now - park_since) / 1000ull : 0ull, s_last_ring_off,
+              s_gcm_context_ea ? vm_read32(s_gcm_context_ea + 0x8) : 0);
+      for (u32 t = 0; t < 16; t++) { u32 k = (s_tr_i + GCM_TRACE_N - 16 + t) % GCM_TRACE_N;
+          fprintf(stderr, "[REFHIST]  walked io=%08X w=%08X\n", s_tr_off[k], s_tr_w[k]); }
+      for (u32 t = 0; t < 8; t++) { u32 k = (s_cf_i + t) % 8;
+          fprintf(stderr, "[REFHIST]  ctlflow io=%08X w=%08X\n", s_cf_off[k], s_cf_w[k]); }
+      for (int k = -8; k < 16; k++) { u32 io = s_fifo_getoff + (u32)(k * 4), ea = gcm_io2ea(io);
+          fprintf(stderr, "[REFHIST]  get%+4d io=%08X w=%08X\n", k * 4, io, ea ? vm_read32(ea) : 0xDEADDEADu); }
+      for (int k = -16; k < 8; k++) { u32 io = put + (u32)(k * 4), ea = gcm_io2ea(io);
+          fprintf(stderr, "[REFHIST]  put%+4d io=%08X w=%08X\n", k * 4, io, ea ? vm_read32(ea) : 0xDEADDEADu); }
+      /* Every SET_REFERENCE in the first 1 MB of IO, and its argument. */
+      for (u32 io = 0; io + 8 <= 0x100000u; io += 4) { u32 ea = gcm_io2ea(io); if (!ea) continue;
+          u32 w = vm_read32(ea);
+          if ((w & 0xE0001FFCu) == 0x00000050u && ((w >> 18) & 0x7FFu) == 1u) { u32 dea = gcm_io2ea(io + 4);
+              fprintf(stderr, "[REFHIST]  SETREF io=%08X arg=%08X\n", io, dea ? vm_read32(dea) : 0xDEADu); } } }
+}
+
 static void gcm_ref_publish_one(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    { const u32 i = s_refh_i; s_refh_v[i % GCM_REF_HIST] = s_ref_q[h % GCM_REF_QLEN];
+      s_refh_t[i % GCM_REF_HIST] = ps3_qpc_us(); s_refh_tid[i % GCM_REF_HIST] = GetCurrentThreadId();
+      s_refh_i = i + 1; }
     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
      * when redirected, so its interleaving with an stderr probe is not a
      * timeline. Same stream = same ordering. */
@@ -3188,6 +3226,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    /* MM_DRAINWHY=1: every 5 s, drain passes and bytes per stop reason --
+     * "caught-up" = waiting for the title to write, "parked" = waiting at a
+     * self-JUMP (a hole an SPU job fills), "flip" = paced by presents. */
+    { static int s_dw = -1; if (s_dw < 0) { const char* e = getenv("MM_DRAINWHY"); s_dw = (e && *e == '1'); }
+      if (s_dw) {
+          static const char* names[8]; static unsigned long np[8]; static unsigned long long nb[8];
+          static unsigned long long t0;
+          extern unsigned long long ps3_ms_now(void);
+          int k = 0; for (; k < 8 && names[k] && names[k] != why; k++) {}
+          if (k < 8) { names[k] = why; np[k]++; nb[k] += (s_fifo_getoff >= start_off) ? s_fifo_getoff - start_off : 0; }
+          const unsigned long long now = ps3_ms_now();
+          if (!t0) t0 = now;
+          if (now - t0 >= 5000) { t0 = now;
+              fprintf(stderr, "[DRAINWHY]");
+              for (int j = 0; j < 8 && names[j]; j++) {
+                  fprintf(stderr, " %s=%lu/%lluKB", names[j], np[j], nb[j] >> 10); np[j] = 0; nb[j] = 0; }
+              fprintf(stderr, "\n"); } } }
     if (s_draindbg) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)

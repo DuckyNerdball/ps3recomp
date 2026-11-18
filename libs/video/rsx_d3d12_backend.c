@@ -238,7 +238,15 @@ typedef struct {
     ID3DBlob* vs;
     int uses_c03;
 } VPVSEntry;
-#define VP_VS_CACHE 128 /* wave uses 5+ distinct VPs; at 4 the cache
+/* Slots are STABLE: draws and pipeline-cache entries hold a slot index, so
+ * an eviction that shifted every entry down (the old memmove) re-pointed every
+ * recorded vs_idx and invalidated every cached pipeline at once -- in Zack's
+ * House fights the 128-entry cache overflowed and each eviction cost up to
+ * ~2800 pipeline recompiles in 5 s. 1024 slots, hash-indexed, round-robin
+ * replacement when full (only the replaced slot's users miss). */
+#define VP_VS_CACHE 1024
+#define VP_VS_INDEX 2048
+/* (history) wave uses 5+ distinct VPs; at 4 the cache
                          * thrashed every frame and eviction shifted slots
                          * under recorded vs_idx values -- the display mesh
                          * drew with the WRONG vertex program (sub-rect +
@@ -276,7 +284,12 @@ typedef struct {
  * single frame, so the FIFO evicted entries that were needed again immediately
  * and ~17 shaders were recompiled EVERY frame -- about half the frame's CPU
  * time. Entries are small (a PSO pointer plus key fields). */
-#define VP_FP_CACHE 256
+/* 256 was not enough either: Zack's House fights pushed the working set past
+ * it and the FIFO eviction turned into compile storms (one 5 s window: 324
+ * misses, 9.3 s in PSO creation, a 21.6 s frame). 4096 entries, found through a
+ * hash index instead of a linear scan of every entry per draw. */
+#define VP_FP_CACHE 4096
+#define VP_FP_INDEX 8192           /* open-addressing index, power of two > 2x cache */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -429,6 +442,7 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+volatile u32 g_mm_last_draws = 0;   /* draws in the last rendered frame (cellPad fuzz: gameplay-live gate) */
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
@@ -537,7 +551,7 @@ static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
  * spend an afternoon optimising the wrong loop. */
 static double s_perf_tex = 0.0, s_perf_frame = 0.0, s_perf_vtx = 0.0, s_perf_rf = 0.0;
 static double s_perf_gpu = 0.0, s_perf_pre = 0.0, s_perf_srv = 0.0, s_perf_pso = 0.0;
-static int s_perf_pso_calls = 0, s_perf_pso_miss = 0, s_perf_pso_hashbytes = 0;
+static int s_perf_pso_calls = 0, s_perf_pso_miss = 0, s_perf_pso_hashbytes = 0, s_perf_ps_blob_hits = 0;
 static u64    s_perf_nverts = 0;
 static u64    s_perf_texbytes = 0;
 static int    s_perf_ntex = 0;
@@ -1923,6 +1937,120 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
     return h ? h : 1u;
 }
 
+/* ---------------------------------------------------------------------------
+ * Shader bytecode cache: memory + disk.
+ *
+ * Key = FNV-1a 64 of the HLSL text, salted with the shader kind and
+ * SC_FORMAT. The text fully determines what D3DCompile produces with our fixed
+ * flags, so a cached blob can never be stale; bump SC_FORMAT when compile flags
+ * or targets change. A pipeline miss that differs only in fixed-function state
+ * (blend, depth/stencil, cull, target format) reuses the blob instead of
+ * recompiling, and with the disk pack a new run starts with every shader any
+ * earlier run compiled.
+ *
+ * Disk: one append-only pack, <MM_SHADER_CACHE_DIR or .\shadercache>\shaders.bin,
+ * records { u32 magic 'SCB1', u32 len, u64 key, bytes[len] }. Loaded whole on
+ * first use; a torn or garbage tail stops the load there and the file is cut
+ * back to the last good record before anything is appended.
+ * MM_SHADER_CACHE=0 disables the disk half (memory cache stays).
+ * ------------------------------------------------------------------------- */
+#define SC_FORMAT 1u
+#define SC_SLOTS  32768u                /* power of two; ~16k shaders */
+#define SC_MAGIC  0x31424353u           /* 'SCB1' */
+static struct { u64 h; ID3DBlob* b; } s_sc[SC_SLOTS];
+static u32 s_sc_n;
+static FILE* s_sc_fp;
+static int s_sc_disk = -1;
+static unsigned s_sc_loaded, s_sc_written;
+
+static u64 sc_key(const char* text, u32 kind)
+{
+    u64 h = 1469598103934665603ull ^ ((u64)kind << 32) ^ SC_FORMAT;
+    for (const char* q = text; *q; q++) { h ^= (u8)*q; h *= 1099511628211ull; }
+    return h ? h : 1;
+}
+static ID3DBlob* sc_find(u64 h)
+{
+    for (u32 i = (u32)h & (SC_SLOTS - 1), p = 0; p < SC_SLOTS; p++, i = (i + 1) & (SC_SLOTS - 1)) {
+        if (!s_sc[i].b) return NULL;
+        if (s_sc[i].h == h) return s_sc[i].b;
+    }
+    return NULL;
+}
+static int sc_insert(u64 h, ID3DBlob* b)   /* takes a reference on b */
+{
+    if (s_sc_n >= SC_SLOTS / 2) return 0;
+    for (u32 i = (u32)h & (SC_SLOTS - 1), p = 0; p < SC_SLOTS; p++, i = (i + 1) & (SC_SLOTS - 1)) {
+        if (s_sc[i].b && s_sc[i].h == h) return 0;
+        if (!s_sc[i].b) { s_sc[i].h = h; s_sc[i].b = b; b->lpVtbl->AddRef(b); s_sc_n++; return 1; }
+    }
+    return 0;
+}
+static void sc_open(void)
+{
+    if (s_sc_disk >= 0) return;
+    const char* e = getenv("MM_SHADER_CACHE");
+    s_sc_disk = (e && *e == '0') ? 0 : 1;
+    if (!s_sc_disk) return;
+    char dir[512], path[600];
+    const char* d = getenv("MM_SHADER_CACHE_DIR");
+    snprintf(dir, sizeof dir, "%s", (d && *d) ? d : "shadercache");
+    CreateDirectoryA(dir, NULL);
+    snprintf(path, sizeof path, "%s/shaders.bin", dir);
+    long good = 0;
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        for (;;) {
+            u32 hdr[2]; u64 key;
+            if (fread(hdr, 4, 2, f) != 2 || fread(&key, 8, 1, f) != 1) break;
+            if (hdr[0] != SC_MAGIC || hdr[1] == 0 || hdr[1] > (8u << 20)) break;
+            ID3DBlob* b = NULL;
+            if (FAILED(D3DCreateBlob(hdr[1], &b)) || !b) break;
+            if (fread(b->lpVtbl->GetBufferPointer(b), 1, hdr[1], f) != hdr[1]) { b->lpVtbl->Release(b); break; }
+            if (sc_insert(key, b)) s_sc_loaded++;
+            b->lpVtbl->Release(b);
+            good = ftell(f);
+        }
+        fseek(f, 0, SEEK_END);
+        const long size = ftell(f);
+        fclose(f);
+        if (size != good) {   /* torn tail from a killed run: cut it off */
+            HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+            if (h != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER li; li.QuadPart = good;
+                SetFilePointerEx(h, li, NULL, FILE_BEGIN); SetEndOfFile(h); CloseHandle(h);
+            }
+            fprintf(stderr, "[shadercache] dropped a %ld-byte damaged tail%c", size - good, 10);
+        }
+    }
+    s_sc_fp = fopen(path, "ab");
+    fprintf(stderr, "[shadercache] %s: %u shaders loaded%s%c", path, s_sc_loaded,
+            s_sc_fp ? "" : " (read-only: cannot append)", 10);
+}
+/* Cached blob for this HLSL (a new reference), or NULL. */
+static ID3DBlob* sc_get(const char* hlsl, u32 kind, u64* key_out)
+{
+    sc_open();
+    const u64 h = sc_key(hlsl, kind);
+    if (key_out) *key_out = h;
+    ID3DBlob* b = sc_find(h);
+    if (b) b->lpVtbl->AddRef(b);
+    return b;
+}
+/* Remember a freshly compiled blob (memory, and disk when enabled). */
+static void sc_put(u64 h, ID3DBlob* b)
+{
+    if (!sc_insert(h, b) || !s_sc_fp) return;
+    const u32 len = (u32)b->lpVtbl->GetBufferSize(b);
+    const u32 hdr[2] = { SC_MAGIC, len };
+    fwrite(hdr, 4, 2, s_sc_fp); fwrite(&h, 8, 1, s_sc_fp);
+    fwrite(b->lpVtbl->GetBufferPointer(b), 1, len, s_sc_fp);
+    fflush(s_sc_fp);
+    s_sc_written++;
+}
+#define SC_KIND_PS 1u
+#define SC_KIND_VS 2u
+
 static int vp_get_vs(const rsx_state* st)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
@@ -1947,8 +2075,12 @@ static int vp_get_vs(const rsx_state* st)
       const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
       if (instrs) vlen = instrs * 16u; }
     u32 hash = vp_hash_ucode(vuc, vlen);
-    for (int i = 0; i < s_d3d.vp_vs_n; i++)
-        if (s_d3d.vp_vs[i].hash == hash) return i;
+    static int s_vs_index[VP_VS_INDEX];   /* slot index + 1, 0 = empty */
+    for (u32 q = hash & (VP_VS_INDEX - 1), pr = 0; pr < VP_VS_INDEX; pr++, q = (q + 1) & (VP_VS_INDEX - 1)) {
+        const int i = s_vs_index[q] - 1;
+        if (i < 0) break;
+        if (i < s_d3d.vp_vs_n && s_d3d.vp_vs[i].hash == hash) return i;
+    }
 
     static char hlsl[262144];
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
@@ -2006,8 +2138,14 @@ static int vp_get_vs(const rsx_state* st)
         }
     }
     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
-                            "main", "vs_5_0", 0, 0, &vb, &e);
+    u64 vs_key = 0;
+    HRESULT hr = S_OK;
+    vb = sc_get(hlsl, SC_KIND_VS, &vs_key);
+    if (!vb) {
+        hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+                        "main", "vs_5_0", 0, 0, &vb, &e);
+        if (SUCCEEDED(hr) && vb) sc_put(vs_key, vb);
+    }
     if (e) e->lpVtbl->Release(e);
     if (FAILED(hr) || !vb) {
         static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
@@ -2015,13 +2153,19 @@ static int vp_get_vs(const rsx_state* st)
     }
     int slot;
     if (s_d3d.vp_vs_n < VP_VS_CACHE) slot = s_d3d.vp_vs_n++;
-    else {  /* evict slot 0 */
-        if (s_d3d.vp_vs[0].vs) s_d3d.vp_vs[0].vs->lpVtbl->Release(s_d3d.vp_vs[0].vs);
-        memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry)*(VP_VS_CACHE-1));
-        slot = VP_VS_CACHE - 1;
+    else {  /* full: replace round-robin, in place. The old blob is not
+             * released -- a PSO compile this frame may still be reading it. */
+        static int s_rr = 0;
+        slot = s_rr; s_rr = (s_rr + 1) % VP_VS_CACHE;
+        { static int _w = 0; if (PS3_LOG_FIRST(_w, 4)) fprintf(stderr, "[VP] VS cache full (%d) -- replacing slot %d%c", VP_VS_CACHE, slot, 10); }
     }
     s_d3d.vp_vs[slot].hash = hash;
     s_d3d.vp_vs[slot].vs   = vb;
+    /* rebuild the index (rare: once per new program) */
+    memset(s_vs_index, 0, sizeof(s_vs_index));
+    for (int i = 0; i < s_d3d.vp_vs_n; i++)
+        for (u32 q = s_d3d.vp_vs[i].hash & (VP_VS_INDEX - 1);; q = (q + 1) & (VP_VS_INDEX - 1))
+            if (!s_vs_index[q]) { s_vs_index[q] = i + 1; break; }
     s_d3d.vp_vs[slot].uses_c03 =
         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
@@ -2325,6 +2469,18 @@ static u32 dr_unnorm_units(const D3D12DrawRecord* dr, u32 dim[16][3])
  * pow(x, 1/2.2). Without the decode every such texture is gamma-encoded twice
  * (lifted blacks, washed-out menus). Set by fp_gamma_from_dr() before each
  * vp_get_fp_pso call; MM_NO_TEXGAMMA=1 disables (A/B). */
+/* Pipeline-cache index: VP_FP_INDEX slots of (entry index + 1), 0 = empty. */
+static int s_fp_index[VP_FP_INDEX];
+static u32 fp_key_hash(u32 uhash, int vs_idx, u32 vs_hash, u32 blend, int nrt, u32 rtfmt, u32 ctrl,
+                       u32 cmask, u32 cull, u32 cube_mask, u64 zs, u32 unnorm_mask)
+{
+    u64 h = 1469598103934665603ull;
+    const u64 v[12] = { uhash, (u32)vs_idx, vs_hash, blend, (u32)nrt, rtfmt, ctrl, cmask, cull, cube_mask, zs, unnorm_mask };
+    for (int i = 0; i < 12; i++) { h ^= v[i]; h *= 1099511628211ull; h ^= h >> 29; }
+    return (u32)(h ^ (h >> 32));
+}
+static void fp_index_rebuild(void);   /* after an eviction shifts the entries */
+
 static u8 s_fp_gamma[16];
 static void fp_gamma_from_dr(const D3D12DrawRecord* dr)
 {
@@ -2402,7 +2558,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * War HD uploads its fragment programs into a ring every frame: keyed on the
      * address, every draw of every frame missed and went through a full
      * decompile + D3DCompile (179 draws -> seconds per frame on its menu). */
-    for (int i = 0; i < s_d3d.vp_fp_n; i++)
+    const u32 khash = fp_key_hash(uhash, vs_idx, vs_hash, blend, nrt, (u32)rtfmt, ctrl, cmask, cull, cube_mask, zs, unnorm_mask);
+    for (u32 slot = khash & (VP_FP_INDEX - 1), probe = 0; probe < VP_FP_INDEX; probe++, slot = (slot + 1) & (VP_FP_INDEX - 1)) {
+        const int i = s_fp_index[slot] - 1;
+        if (i < 0) break;                                    /* empty: not cached */
         if (s_d3d.vp_fp[i].ucode_hash != uhash) continue;   /* cheap reject first */
         else if (s_d3d.vp_fp[i].vs_idx == vs_idx &&
             s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
@@ -2414,6 +2573,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].unnorm_mask == unnorm_mask &&
             (!unnorm_mask || memcmp(s_d3d.vp_fp[i].unnorm_dim, unnorm_dim, sizeof(s_d3d.vp_fp[i].unnorm_dim)) == 0))
             return s_d3d.vp_fp[i].pso;
+    }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -2704,8 +2864,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
     }
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
-                            "main", "ps_5_0", 0, 0, &pb, &e);
+    u64 hl_h = 0;
+    HRESULT hr = S_OK;
+    pb = sc_get(hlsl, SC_KIND_PS, &hl_h);
+    if (pb) s_perf_ps_blob_hits++;
+    else {
+        hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
+                        "main", "ps_5_0", 0, 0, &pb, &e);
+        if (SUCCEEDED(hr) && pb) sc_put(hl_h, pb);
+    }
     if (FAILED(hr) || !pb) {
         static int _e2=0; if (PS3_LOG_FIRST(_e2, 16))
             printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
@@ -2825,11 +2992,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
     rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
 
-    /* insert (evict oldest when full) */
+    /* insert (evict oldest when full). The evicted pipeline is NOT released:
+     * this frame's command list may already reference it (the pre-pass fetches
+     * every draw's PSO before any is recorded), and freeing it under the GPU is
+     * a use-after-free. At 4096 entries an eviction is rare; the leak is a
+     * pointer per eviction. */
     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
-        if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
+        { static int _w = 0; if (PS3_LOG_FIRST(_w, 4)) fprintf(stderr, "[FP] pipeline cache full (%d) -- evicting oldest%c", VP_FP_CACHE, 10); }
         memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
         s_d3d.vp_fp_n = VP_FP_CACHE - 1;
+        fp_index_rebuild();
     }
     s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
     s_d3d.vp_fp[s_d3d.vp_fp_n].vs_idx  = vs_idx;
@@ -2850,8 +3022,22 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         memset(s_d3d.vp_fp[s_d3d.vp_fp_n].unnorm_dim, 0, sizeof(s_d3d.vp_fp[s_d3d.vp_fp_n].unnorm_dim));
     s_d3d.vp_fp[s_d3d.vp_fp_n].zs      = zs;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
+    for (u32 slot = khash & (VP_FP_INDEX - 1);; slot = (slot + 1) & (VP_FP_INDEX - 1))
+        if (!s_fp_index[slot]) { s_fp_index[slot] = s_d3d.vp_fp_n + 1; break; }
     s_d3d.vp_fp_n++;
     return pso;
+}
+
+static void fp_index_rebuild(void)
+{
+    memset(s_fp_index, 0, sizeof(s_fp_index));
+    for (int i = 0; i < s_d3d.vp_fp_n; i++) {
+        const VPFPEntry* q = &s_d3d.vp_fp[i];
+        const u32 k = fp_key_hash(q->ucode_hash, q->vs_idx, q->vs_hash, q->blend, q->nrt, q->rtfmt, q->ctrl,
+                                  q->cmask, q->cull, q->cube_mask, q->zs, q->unnorm_mask);
+        for (u32 slot = k & (VP_FP_INDEX - 1);; slot = (slot + 1) & (VP_FP_INDEX - 1))
+            if (!s_fp_index[slot]) { s_fp_index[slot] = i + 1; break; }
+    }
 }
 
 /* Upload the guest texture for a VP draw into a per-frame texture slot
@@ -5523,7 +5709,14 @@ static void render_frame(void)
                 off_rt_find(dr->tex[_u].raw) < 0) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
-                if (en) {
+                /* Only a texture that IS a registered display buffer is the
+                 * rendered frame. Any other display-sized image is guest data:
+                 * Bink's 1280x720 luma plane (B8) was being swapped for the
+                 * previous frame, so every movie decoded posterized/white.
+                 * SCREEN_AS_TEX=2 restores the old match-by-size rule. */
+                extern int cellGcmOffsetIsDisplay(u32 offset);
+                const int is_disp = cellGcmOffsetIsDisplay(dr->tex[_u].raw);
+                if (en == 2 || (en == 1 && is_disp)) {
                     { static int _n = 0; if (PS3_LOG_FIRST(_n, 3))
                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
                                         " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
@@ -6268,7 +6461,7 @@ static void render_frame(void)
             double fr = s_perf_frame > 0 ? s_perf_frame : 1;
             fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
-                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)%c",
+                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS (%d ps-cached) %dKB hashed] | guest %.2fs (%.0f%%)%c",
                     20.0 / fr,
                     s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
                     s_perf_vtx, 100.0 * s_perf_vtx / fr,
@@ -6277,11 +6470,11 @@ static void render_frame(void)
                     s_perf_pre, 100.0 * s_perf_pre / fr,
                     s_perf_srv, 100.0 * s_perf_srv / fr,
                     s_perf_pso, 100.0 * s_perf_pso / fr,
-                    s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
+                    s_perf_pso_calls, s_perf_pso_miss, s_perf_ps_blob_hits, s_perf_pso_hashbytes / 1024,
                     fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr, 10);
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
-            s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
+            s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_ps_blob_hits = 0; s_perf_pso_hashbytes = 0;
             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
         }
     }
@@ -6301,6 +6494,27 @@ static void render_frame(void)
         s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
     }
     s_dbg_last_draws = s_d3d.draw_count;
+    { extern volatile u32 g_mm_last_draws; g_mm_last_draws = s_d3d.draw_count; }
+    /* MM_FRAMESTAT=1: every 5 s, the intervals between rendered guest frames
+     * (render_frame with >= 1 draw): count, mean, 95th percentile and max, in
+     * ms, plus the mean draw count. The soak harness turns these into gameplay
+     * FPS, worst-5% FPS and the longest frame. */
+    { static int on = -1; if (on < 0) on = getenv("MM_FRAMESTAT") ? 1 : 0;
+      if (on && s_d3d.draw_count) {
+          static LARGE_INTEGER f, last; static double iv[4096]; static u32 ni; static double t0; static u64 dsum;
+          LARGE_INTEGER now; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
+          const double tms = (double)now.QuadPart * 1000.0 / (double)f.QuadPart;
+          if (last.QuadPart && ni < 4096) { iv[ni++] = tms - (double)last.QuadPart * 1000.0 / (double)f.QuadPart; dsum += s_d3d.draw_count; }
+          last = now; if (t0 == 0) t0 = tms;
+          if (tms - t0 >= 5000.0 && ni) {
+              /* partial selection for p95 and max */
+              double mx = 0, sum = 0; for (u32 i = 0; i < ni; i++) { sum += iv[i]; if (iv[i] > mx) mx = iv[i]; }
+              u32 k = (u32)(ni * 0.95); if (k >= ni) k = ni - 1;
+              for (u32 i = 0; i <= k; i++) for (u32 j = i + 1; j < ni; j++)   /* ni <= ~300: fine */
+                  if (iv[j] < iv[i]) { double t = iv[i]; iv[i] = iv[j]; iv[j] = t; }
+              fprintf(stderr, "[FRAMESTAT] frames=%u mean=%.1fms p95=%.1fms max=%.1fms draws=%llu\n",
+                      ni, sum / ni, iv[k], mx, (unsigned long long)(dsum / ni));
+              ni = 0; dsum = 0; t0 = tms; } } }
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
     s_d3d.vp_ib_offset = 0;
@@ -6449,8 +6663,22 @@ skip_dump_consider: ;
     if (s_strobe < 0) s_strobe = getenv("MM_STROBE_RDOC") ? 1 : 0;
     const int strobe_copy = s_strobe && s_d3d.readback_buf && !dumping && s_dbg_last_draws >= 50;
     if (s_strobe_fire && s_rdoc_active) dumping = 1;   /* keep a BMP of each captured frame */
-    if (dumping || strobe_copy) {
-        if (s_strobe) screen_copy_capture(fi);   /* don't perturb what is being observed */
+    /* MM_LUMALOG=<period ms>[:<burst>] (needs CELLMARK_DUMP for the readback
+     * buffer): every period, the mean luma of <burst> CONSECUTIVE rendered
+     * frames (default 4) as one [LUMA] line. Consecutive, because the known
+     * strobe flips every other present -- isolated samples alias onto one
+     * phase. The soak harness flags runs where the burst alternates. */
+    static long long s_lu_per = -1, s_lu_next = 0; static int s_lu_burst = 4, s_lu_left = 0, s_lu_n = 0;
+    static double s_lu_v[16];
+    if (s_lu_per < 0) { const char* e = getenv("MM_LUMALOG"); s_lu_per = e ? atoll(e) : 0;
+                        const char* c = e ? strchr(e, ':') : NULL; if (c) s_lu_burst = atoi(c + 1);
+                        if (s_lu_burst < 2) s_lu_burst = 2; if (s_lu_burst > 16) s_lu_burst = 16; }
+    if (s_lu_per > 0 && !s_lu_left) { const long long nw = (long long)GetTickCount64();
+        if (!s_lu_next) s_lu_next = nw + s_lu_per;
+        if (nw >= s_lu_next && s_dbg_last_draws >= 1) { s_lu_left = s_lu_burst; s_lu_n = 0; s_lu_next = nw + s_lu_per; } }
+    const int luma_copy = s_lu_left > 0 && s_d3d.readback_buf && !dumping && !strobe_copy && s_dbg_last_draws >= 1;
+    if (dumping || strobe_copy || luma_copy) {
+        if (s_strobe || luma_copy) screen_copy_capture(fi);   /* don't perturb what is being observed */
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -6565,6 +6793,27 @@ skip_dump_consider: ;
                 fprintf(stderr, "[STROBE] alternating luma (%.0f, %.0f, %.0f, %.0f) -- capturing%c",
                         h[0], h[1], h[2], h[3], 10);
             }
+        }
+    } else if (luma_copy) {
+        wait_for_gpu();
+        void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
+        double l0 = 0;
+        if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &rr, &mp)) && mp) {
+            double sum = 0; u32 n = 0;
+            for (u32 y = 8; y < s_d3d.height; y += 16)
+                for (u32 x = 8; x < s_d3d.width; x += 16) {
+                    const unsigned char* p = (const unsigned char*)mp + (u64)y * s_d3d.readback_pitch + x * 4u;
+                    sum += (p[0] + p[1] + p[2]) / 3.0; n++;
+                }
+            D3D12_RANGE wr = {0, 0};
+            s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
+            l0 = n ? sum / n : 0;
+        }
+        s_lu_v[s_lu_n++] = l0;
+        if (--s_lu_left == 0) {
+            fprintf(stderr, "[LUMA] t=%llu draws=%u l=", (unsigned long long)GetTickCount64(), s_dbg_last_draws);
+            for (int q = 0; q < s_lu_n; q++) fprintf(stderr, "%s%.0f", q ? "," : "", s_lu_v[q]);
+            fputc(10, stderr);
         }
     }
     /* Captures every 3rd frame: back-to-back requests land on every other

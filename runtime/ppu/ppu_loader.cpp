@@ -996,6 +996,9 @@ extern "C" void ppu_report_guest_lrs(void)
         { extern void ppu_dump_bctrl_ring(uint32_t, const char*);
           if (getenv("BCTRL_RING")) ppu_dump_bctrl_ring((uint32_t)c->thread_id, "watchdog"); }
     }
+    /* A thread parked in sys_cond_wait shows only the lr of the wrapper that
+     * called it; name the cond and whoever last signalled it. */
+    { extern void sys_cond_report_waiters(void); sys_cond_report_waiters(); }
     fflush(stderr);
 }
 

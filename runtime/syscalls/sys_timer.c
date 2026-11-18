@@ -170,6 +170,22 @@ int64_t sys_timer_usleep(ppu_context* ctx)
               const uint8_t* p = vm_base + a;
               fprintf(stderr, "[FENCEWAIT] n=%lu addr=0x%08X val=0x%08X want=0x%08X\n", n, a,
                       ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3], (uint32_t)ctx->gpr[30]); } } }
+    /* MM_REFWAIT=<lr hex>: an equality wait on the RSX ref register (UE3
+     * func_0016FBB0: while (ctrl->ref != r31) usleep(30); ctrl in r30). Once
+     * one target has been waited on for 3 s, report it with the recently
+     * published fences -- did the value go by, or was it never queued? */
+    { static int s_rw = -1; static uint32_t s_rwlr;
+      if (s_rw < 0) { const char* e = getenv("MM_REFWAIT"); s_rw = e ? 1 : 0; s_rwlr = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_rw && (uint32_t)ctx->lr == s_rwlr) {
+          extern unsigned long long ps3_qpc_us(void);
+          static uint32_t s_tgt = 0xFFFFFFFFu; static unsigned long long s_t0; static int s_rep;
+          const uint32_t tgt = (uint32_t)ctx->gpr[31];
+          if (tgt != s_tgt) { s_tgt = tgt; s_t0 = ps3_qpc_us(); s_rep = 0; }
+          else if (!s_rep && ps3_qpc_us() - s_t0 > 3000000ull) { s_rep = 1;
+              extern uint8_t* vm_base; const uint8_t* p = vm_base + (uint32_t)ctx->gpr[30] + 8;
+              fprintf(stderr, "[REFWAIT] tid=%u waiting 3s for ref==0x%08X, ref now 0x%08X\n", (unsigned)ctx->thread_id, tgt,
+                      ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]);
+              extern void cellGcm_ref_dump_recent(void); cellGcm_ref_dump_recent(); } } }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (PS3_LOG_FIRST(n, 60))

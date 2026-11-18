@@ -179,6 +179,11 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+/* Bounded code regions resident at once per context (resident_code). Monster Madness keeps
+ * FMOD ph1 + ph3, the SPUJOBS blob, packed jobs and ATRAC live together; at 4 the job blob
+ * found no slot and ran interpreted (12M steps/s). */
+#define SPU_RESIDENT_SLOTS 8u
+
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -306,7 +311,7 @@ typedef struct spu_context {
          * (spu_overlay_register_region_reloc): its functions are registered at
          * canon + offset, wherever the title placed this copy. 0 = ordinary placed lift. */
         uint32_t canon;
-    } resident_code[4];
+    } resident_code[SPU_RESIDENT_SLOTS];
     /* Placement minus canonical base of the relocatable code running now (spu_lifter.py
      * --reloc): lifted relocatable code adds it to every address it derives from its own
      * pc. Set by the dispatcher on entry into such code; only that code reads it. */

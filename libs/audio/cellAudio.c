@@ -742,13 +742,16 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
         audio_dump_mix();
+        /* Silence is judged on the game's mix, BEFORE MM_VOLUME: a muted test
+         * run (MM_VOLUME=0) must still report how much the guest produced. */
+        int blk_silent = 1;
+        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { blk_silent = 0; break; }
         mm_audio_post(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES); audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
-              if (!nz) z++; }
+            if (blk_silent) z++;
             if (now - t0 >= 5000) {
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, underruns %llu, device buf %u, holes %u+%u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),

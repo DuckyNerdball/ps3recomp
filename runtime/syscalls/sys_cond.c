@@ -16,7 +16,10 @@
 struct sys_cond_waiter {
     struct sys_cond_waiter* next;
     int signalled;
+    uint32_t tid;                  /* diagnostics only */
+    unsigned long long since_us;
 };
+extern unsigned long long ps3_qpc_us(void);
 
 sys_cond_info g_sys_conds[SYS_COND_MAX];
 uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
@@ -95,6 +98,7 @@ int64_t sys_cond_create(ppu_context* ctx)
         }
         c->mutex_id = mid;
         c->waiters = NULL;
+        c->last_sig_tid = 0; c->nsig = 0; c->last_sig_us = 0;
         memset(c->name, 0, sizeof(c->name));
         /* sys_cond_attribute_t: pshared, flags, ipc_key u64 @0x08, name[8]
          * @0x10. Offset 8 copied the ipc_key into the log name. */
@@ -170,7 +174,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
-    struct sys_cond_waiter waiter = {NULL, 0};
+    struct sys_cond_waiter waiter = {NULL, 0, (uint32_t)ctx->thread_id, ps3_qpc_us()};
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;
     *tail = &waiter;
@@ -229,10 +233,11 @@ int64_t sys_cond_wait(ppu_context* ctx)
     return result;
 }
 
-static int64_t signal_cond(uint32_t id, int all)
+static int64_t signal_cond(uint32_t id, int all, uint32_t tid)
 {
     sys_cond_info* c = acquire_cond(id);
     if (!c) return (int32_t)CELL_ESRCH;
+    c->last_sig_tid = tid; c->nsig++; c->last_sig_us = ps3_qpc_us();
     int selected = 0;
     for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
         if (w->signalled) continue;
@@ -247,11 +252,41 @@ static int64_t signal_cond(uint32_t id, int all)
     return CELL_OK;
 }
 
-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0, (uint32_t)ctx->thread_id); }
+int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1, (uint32_t)ctx->thread_id); }
 
 /* Preserve upstream's current broadcast fallback for signal_to. */
-int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1, (uint32_t)ctx->thread_id); }
+
+/* Watchdog: every guest thread parked in sys_cond_wait for 10 s or more, with
+ * the cond's name and mutex and the last signal it received (by whom, how long
+ * ago, how many in total). "Never signalled since the wait began" vs "signalled
+ * by thread T a moment before" separates a missing producer from a lost wakeup.
+ * Takes each cond's signal lock briefly; never called with one held. */
+void sys_cond_report_waiters(void)
+{
+    const unsigned long long now = ps3_qpc_us();
+    for (unsigned i = 0; i < SYS_COND_MAX; ++i) {
+        sys_cond_info* c = &g_sys_conds[i];
+        if (!c->active || !c->waiters) continue;
+        cond_lock(c);
+        for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
+            if (w->signalled || now - w->since_us < 10000000ull) continue;
+            char name[9]; memcpy(name, c->name, 8); name[8] = 0;
+            const sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
+            char mname[9]; memcpy(mname, m->name, 8); mname[8] = 0;
+            fprintf(stderr, "[WATCHDOG]   cond %u '%s' (mutex %u '%s'): tid %u waiting %.1fs; ",
+                    i + 1, name, c->mutex_id, mname, w->tid, (double)(now - w->since_us) / 1e6);
+            if (c->nsig)
+                fprintf(stderr, "last signal tid %u %.1fs ago (%s the wait began), %u total\n",
+                        c->last_sig_tid, (double)(now - c->last_sig_us) / 1e6,
+                        c->last_sig_us >= w->since_us ? "after" : "before", c->nsig);
+            else
+                fprintf(stderr, "never signalled\n");
+        }
+        cond_unlock(c);
+    }
+}
 
 void sys_cond_init(lv2_syscall_table* tbl)
 {

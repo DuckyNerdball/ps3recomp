@@ -149,6 +149,13 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             "-> status=%d%s%s\n",
             ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
+    if (r.faulted) {   /* how it got there */
+        fprintf(stderr, "[SPU]   tid=0x%X img=%d task=%d ovl=%d r0=0x%05X r3=0x%08X depth=%u last PCs:",
+                ctx->spu_id, ctx->image_id, (int)ctx->resident_task, (int)ctx->resident_ovl,
+                ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], (unsigned)ctx->host_depth);
+        for (unsigned q = 0; q < 8; q++) fprintf(stderr, " 0x%05X", g_spu_pch[(g_spu_pch_n + q) & 7u]);
+        fprintf(stderr, "\n");
+    }
     fflush(stderr);
 
     /* This thread run has ended; remove observer references and release its

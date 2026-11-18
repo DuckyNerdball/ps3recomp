@@ -123,6 +123,7 @@ unsigned cellGcm_flip_request_count(void);
 #if defined(_WIN32)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
+extern "C" void spu_overlay_snapshot_sources(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_d3d12_backend_init
 #  define rsx_backend_present rsx_d3d12_backend_present
@@ -443,6 +444,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    spu_overlay_snapshot_sources();  /* lifted bytes, before guest code runs */
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 

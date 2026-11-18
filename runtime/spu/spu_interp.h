@@ -26,6 +26,10 @@ typedef void (*spu_lifted_fn)(spu_context*);
  * authoritative misses), then task, overlay, and primary image. This is the
  * same resolver used by indirect dispatch. NULL ctx retains wildcard lookup. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
+/* spu_channels.c: claim an intact pristine code region covering pc; 1 = claimed. */
+int spu_ovl_reclaim_at(spu_context* ctx, uint32_t pc);
+/* spu_channels.c: lifted code can take over at pc (lookup, taskset task image, intact-region re-claim). */
+int spu_rejoin_lookup(spu_context* ctx, uint32_t pc);
 
 /* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a
  * host-fatal decode. Handles all control flow internally. Returns the stop

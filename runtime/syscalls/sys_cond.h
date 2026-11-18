@@ -36,6 +36,10 @@ typedef struct sys_cond_info {
     char     name[8];
     int      initialized;
     struct sys_cond_waiter* waiters;
+    /* Diagnostics for the watchdog (sys_cond_report_waiters). */
+    uint32_t last_sig_tid;
+    uint32_t nsig;
+    unsigned long long last_sig_us;
 
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
@@ -56,6 +60,9 @@ int64_t sys_cond_wait(ppu_context* ctx);
 int64_t sys_cond_signal(ppu_context* ctx);
 int64_t sys_cond_signal_all(ppu_context* ctx);
 int64_t sys_cond_signal_to(ppu_context* ctx);
+
+/* Watchdog report: threads parked in sys_cond_wait >= 10 s, and each cond's last signal. */
+void sys_cond_report_waiters(void);
 
 /* Registration */
 void sys_cond_init(lv2_syscall_table* tbl);

@@ -357,6 +357,10 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         /* A one-way guest stack reset invalidates every lifted host caller.
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
+        /* ...and every drain with them: the longjmp skipped their exits, so
+         * the return pc the innermost one set is stale. An interpreter hand-off
+         * stopping there would end the run at a pc no drain is waiting for. */
+        ctx->drain_ret_pc = 0;
         g_spu_trampoline_fn = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
@@ -596,6 +600,50 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* Idle-poll backoff for GETLLAR.
+ *
+ * The SPURS kernel's workload selection (resident in the policy module, LS
+ * 0x0CF4) re-reads the SPURS instance line with GETLLAR and rescans it when
+ * nothing has changed: ~130k times a second per SPU. On hardware that costs
+ * nothing -- an SPU is its own core. Here every SPU is a host thread, and six of
+ * them at 100% share SMT cores with the guest PPU threads that bound the frame
+ * rate and FMOD's mixer cadence (measured: 6 threads pinned at 100%, process at
+ * 7.9 cores, RSX walker "caught-up" waiting on the guest).
+ *
+ * A GETLLAR that returns exactly the bytes the previous GETLLAR of the same line
+ * on this thread returned is a poll that learned nothing. After a streak of
+ * them, slow the HOST thread down: first `pause` (frees the SMT sibling), then
+ * yield, then ~50 us sleeps. Guest-visible behaviour is unchanged: every GETLLAR
+ * still reads memory, and any change to the line resets the streak at once, so
+ * the extra wake latency is bounded by one sleep. MM_LLAR_BACKOFF=1 enables it
+ * (off by default until a soak batch has measured it). */
+static void spu_llar_idle_note(uint32_t ea, const void* line)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("MM_LLAR_BACKOFF"); s_on = (e && e[0] == '1'); }   /* opt-in until measured */
+    if (!s_on) return;
+    static SPU_THREAD_LOCAL uint32_t b_ea;
+    static SPU_THREAD_LOCAL uint8_t b_line[MFC_ATOMIC_LINE];
+    static SPU_THREAD_LOCAL unsigned b_streak;
+    if (ea != b_ea || memcmp(b_line, line, MFC_ATOMIC_LINE) != 0) {
+        b_ea = ea; memcpy(b_line, line, MFC_ATOMIC_LINE); b_streak = 0;
+        return;
+    }
+    ++b_streak;
+    if (b_streak < 64) return;
+    if (b_streak < 512) { for (int i = 0; i < 16; i++) _mm_pause(); return; }
+    if (b_streak < 2048) { SwitchToThread(); return; }
+    /* ~50 us: a high-resolution waitable timer where the OS has one, else a yield. */
+    static SPU_THREAD_LOCAL HANDLE t_timer; static SPU_THREAD_LOCAL int t_init;
+    if (!t_init) { t_init = 1;
+        t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS); }
+    if (t_timer) {
+        LARGE_INTEGER due; due.QuadPart = -500;   /* 100 ns units, relative */
+        if (SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE)) { WaitForSingleObject(t_timer, 1); return; }
+    }
+    SwitchToThread();
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -815,6 +863,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0]);
           } }
         if (!llar_fast) spu_lockline_unlock();
+        spu_llar_idle_note(ea, ls);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -1824,7 +1873,7 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
      * resolution and the first two usually miss, which is exactly the case a
      * generation-keyed memo answers without walking the hash chain again. */
     if (!ctx) return (spu_lifted_fn)spu_lookup_memoized(lsa, 0);
-    for (unsigned slot = 0; slot < 4; ++slot)
+    for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot)
         if (ctx->resident_code[slot].image_id &&
             lsa >= ctx->resident_code[slot].lsa &&
             lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
@@ -2000,7 +2049,9 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span;
                  uint32_t load_lsa; unsigned code_count; spu_overlay_code_segment* code;
-                 uint32_t canon; } spu_ovl_src;
+                 uint32_t canon;
+                 uint32_t home_lsa; /* non-relocatable region: LS address of its first claim (0 = none yet) */
+               } spu_ovl_src;
 /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
  * the same job code buffer at LS 0x4000, dispatched by content signature). */
 #define SPU_OVL_SRC_MAX 128
@@ -2059,6 +2110,116 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].canon = 0;
         __atomic_store_n(&s_ovl_src_count, s_ovl_src_count + 1, __ATOMIC_RELEASE);
     }
+}
+
+/* Pristine copies of EA-keyed regions, taken right after the ELF load and before any guest
+ * code runs: the bytes the lifter saw. A GET from that EA proves where the bytes came from,
+ * not that they are still the ones lifted -- PPU code may patch an SPU image in RAM before
+ * DMAing it, or build one there. Residency is claimed only for bytes that match.
+ * MM_OVL_SRCCHECK=0 turns the check off (A/B). */
+static uint8_t* s_ovl_pristine[SPU_OVL_SRC_MAX];
+static int s_ovl_srccheck = -1;
+void spu_overlay_snapshot_sources(void)
+{
+    extern uint8_t* vm_base;
+    if (s_ovl_srccheck < 0) { const char* e = getenv("MM_OVL_SRCCHECK"); s_ovl_srccheck = !(e && e[0] == '0'); }
+    if (!s_ovl_srccheck || !vm_base) return;
+    const int n = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const spu_ovl_src* o = &s_ovl_src[i];
+        if (o->has_sig || !o->span || o->canon || o->code || s_ovl_pristine[i]) continue;
+        uint8_t* b = (uint8_t*)malloc(o->span);
+        if (!b) continue;
+        memcpy(b, vm_base + o->src_ea, o->span);
+        s_ovl_pristine[i] = b;
+        fprintf(stderr, "[spu-ovl] pristine copy of image %d src 0x%08X span 0x%X\n", o->image_id, o->src_ea, o->span);
+    }
+}
+/* Do LS bytes [ls, ls+size) equal the pristine region i at offset rel? 1 = yes or unknown. */
+static int spu_ovl_src_intact(int i, uint32_t rel, const uint8_t* ls, uint32_t size, uint32_t lsa)
+{
+    const uint8_t* p = s_ovl_pristine[i];
+    if (!p || rel >= s_ovl_src[i].span) return 1;
+    if (size > s_ovl_src[i].span - rel) size = s_ovl_src[i].span - rel;
+    if (!memcmp(ls, p + rel, size)) return 1;
+    static unsigned long n_bad;
+    if (n_bad++ < 24) {
+        uint32_t first = 0, last = 0, cnt = 0;
+        for (uint32_t k = 0; k < size; k += 4)
+            if (memcmp(ls + k, p + rel + k, size - k < 4 ? size - k : 4)) { if (!cnt) first = k; last = k; cnt++; }
+        fprintf(stderr, "[spu-ovl] image %d src 0x%08X+0x%X -> LS 0x%05X size 0x%X: %u words differ from the lifted "
+                "bytes (LS 0x%05X..0x%05X; first lifted %08X now %08X) -- not resident\n",
+                s_ovl_src[i].image_id, s_ovl_src[i].src_ea, rel, lsa, size, cnt, lsa + first, lsa + last,
+                (unsigned)((p[rel + first] << 24) | (p[rel + first + 1] << 16) | (p[rel + first + 2] << 8) | p[rel + first + 3]),
+                (unsigned)((ls[first] << 24) | (ls[first + 1] << 16) | (ls[first + 2] << 8) | ls[first + 3]));
+    }
+    return 0;
+}
+
+/* Claim non-relocatable pristine region i at its home LS address iff every byte
+ * there equals the lifted bytes (see the re-claim note in spu_overlay_note_get).
+ * 1 = claimed now; 0 = already claimed, unknown home, or bytes differ. */
+static int spu_ovl_try_reclaim(spu_context* ctx, int i)
+{
+    const spu_ovl_src* o = &s_ovl_src[i];
+    const uint32_t home = o->home_lsa;
+    if (!s_ovl_pristine[i] || !home || home + o->span > SPU_LS_SIZE) return 0;
+    unsigned free_slot = SPU_RESIDENT_SLOTS;
+    for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot) {
+        if (ctx->resident_code[slot].image_id == o->image_id && ctx->resident_code[slot].lsa == home &&
+            ctx->resident_code[slot].size >= o->span) return 0;
+        if (!ctx->resident_code[slot].image_id && free_slot == SPU_RESIDENT_SLOTS) free_slot = slot;
+    }
+    if (memcmp(ctx->ls + home, s_ovl_pristine[i], o->span) != 0) return 0;
+    if (free_slot == SPU_RESIDENT_SLOTS) {   /* rotating victim, as in the claim path */
+        static SPU_THREAD_LOCAL unsigned rr2; free_slot = rr2++ % SPU_RESIDENT_SLOTS; }
+    ctx->resident_code[free_slot].lsa = home;
+    ctx->resident_code[free_slot].size = o->span;
+    ctx->resident_code[free_slot].source_ea = o->src_ea;
+    ctx->resident_code[free_slot].image_id = o->image_id;
+    ctx->resident_code[free_slot].verify_state = 0;
+    ctx->resident_code[free_slot].source_index = i;
+    ctx->resident_code[free_slot].canon = 0;
+    spu_dcache_residency_changed(ctx);
+    return 1;
+}
+
+/* About to interpret pc (no lifted code resolves there): if it lies in a
+ * pristine region's home range and the whole region is intact in this local
+ * store, claim it so the caller's next lookup finds the lifted code. Code
+ * reaches an SPU by paths the GET hook does not see (a SPURS context restore,
+ * a task migrating to another SPU): FMOD's ph1 was byte-identical to the lift
+ * yet ran interpreted. Called per interpreted instruction, so a failed compare
+ * skips the next 4096 calls on this thread. MM_OVL_RECLAIM=0 off. */
+int spu_ovl_reclaim_at(spu_context* ctx, uint32_t pc)
+{
+    static int s_rc = -1; if (s_rc < 0) { const char* e = getenv("MM_OVL_RECLAIM"); s_rc = !(e && e[0] == '0'); }
+    if (!s_rc || s_ovl_srccheck <= 0) return 0;
+    static SPU_THREAD_LOCAL unsigned skip;
+    const int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nsrc; i++) {
+        const spu_ovl_src* o = &s_ovl_src[i];
+        if (!o->home_lsa || pc < o->home_lsa || pc - o->home_lsa >= o->span || !s_ovl_pristine[i]) continue;
+        if (skip) { skip--; return 0; }
+        if (spu_ovl_try_reclaim(ctx, i)) {
+            static unsigned long n; if (n++ < 16)
+                fprintf(stderr, "[spu-ovl] spu=0x%X re-claim image %d at LS 0x%05X span 0x%X on dispatch to 0x%05X (bytes intact)\n",
+                        ctx->spu_id, o->image_id, o->home_lsa, o->span, pc);
+            return 1;
+        }
+        { static unsigned long nf; if (nf++ < 12) {
+            uint32_t k = 0; const uint8_t* p = s_ovl_pristine[i];
+            while (k < o->span && ctx->ls[o->home_lsa + k] == p[k]) k++;
+            fprintf(stderr, "[spu-ovl] spu=0x%X no re-claim of image %d at pc 0x%05X: %s (first diff LS 0x%05X)\n",
+                    ctx->spu_id, o->image_id, pc, k >= o->span ? "already claimed" : "bytes differ", o->home_lsa + k);
+            /* MM_INTERP_LSDUMP=<dir>: the local store as it is here (local diagnostics; never commit). */
+            const char* d = getenv("MM_INTERP_LSDUMP");
+            if (d && k < o->span) { char path[512]; snprintf(path, sizeof path, "%s/reclaim_%X_%05X.bin", d, ctx->spu_id, pc);
+                FILE* f = fopen(path, "wb"); if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); } } } }
+        skip = 4096;
+        return 0;
+    }
+    return 0;
 }
 
 /* Register a bounded code image that may coexist with other streamed images.
@@ -2240,6 +2401,36 @@ static int spu_taskset_resident_image(const spu_context* ctx)
  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
 #define SPU_TASKSET_TASK_LO 0x3000u
 
+/* Can lifted code take over at pc? The interpreter's rejoin probe and the
+ * hand-back after it asked only spu_lifted_lookup, with the context's CURRENT
+ * resident_task. But the interpreter is entered low (the SPURS kernel / the
+ * deliberately interpreted policy-module ranges) where resident_task is 0, and
+ * then follows the policy's branch into the task -- which spu_indirect_branch
+ * would have resolved through TaskInfo, and the probe never did. So a whole
+ * lifted task (300176774, LS 0x21000-0x24000, 10-20M steps/s) ran interpreted
+ * until it returned to low LS. Same resolution order as the dispatcher, with
+ * resident_task restored afterwards: deciding it stays the dispatcher's job
+ * (it has a resume path that depends on seeing it unset). Then the intact-
+ * region re-claim. MM_REJOIN_TASK=0: the old lookup-only probe. */
+int spu_rejoin_lookup(spu_context* ctx, uint32_t pc)
+{
+    pc &= SPU_LS_MASK;
+    if (spu_lifted_lookup(ctx, pc)) return 1;
+    static int s_rt = -1; if (s_rt < 0) { const char* e = getenv("MM_REJOIN_TASK"); s_rt = !(e && e[0] == '0'); }
+    if (s_rt && pc >= SPU_TASKSET_TASK_LO && !ctx->policy_mode) {
+        int ti = spu_taskset_resident_image(ctx);
+        if (!ti) ti = spu_taskset_task_image(pc);
+        if (ti && ti != ctx->resident_task) {
+            const int saved = ctx->resident_task;
+            ctx->resident_task = ti;
+            const int ok = spu_lifted_lookup(ctx, pc) != NULL;
+            ctx->resident_task = saved;
+            if (ok) return 1;
+        }
+    }
+    return spu_ovl_reclaim_at(ctx, pc) && spu_lifted_lookup(ctx, pc);
+}
+
 /* Relocatable code span matched by CONTENT, for position-independent code the
  * title first copies to the heap (so its source EA is unknowable) and then DMAs
  * to a different LS address each run. A GET of >= 512 bytes whose first 16
@@ -2335,15 +2526,28 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
       if (cap < 0) { const char* e = getenv("MM_GETLOG"); cap = e ? atoi(e) : 0; }
       static uint32_t lo = 0xFFFFFFFFu;
       if (lo == 0xFFFFFFFFu) { const char* e = getenv("MM_GETLOG_LSA"); lo = e ? (uint32_t)strtoul(e, NULL, 16) : 0x3000u; }
-      if (cap && n < cap && size >= 1024 && lsa >= lo) { n++; extern unsigned long long ps3_qpc_us(void);
+      /* MM_GETLOG_EA=lo-hi[,lo-hi..]: only GETs whose source EA is in a range
+       * (any size, any LS address). */
+      static int ner = -1; static uint32_t er[8][2];
+      if (ner < 0) { ner = 0; const char* e = getenv("MM_GETLOG_EA");
+          while (e && *e && ner < 8) { char* q; er[ner][0] = (uint32_t)strtoul(e, &q, 16);
+              if (*q != '-') break; er[ner][1] = (uint32_t)strtoul(q + 1, &q, 16); ner++;
+              e = (*q == ',') ? q + 1 : 0; } }
+      int ea_ok = !ner;
+      for (int r = 0; r < ner; r++) if (ea >= er[r][0] && ea < er[r][1]) ea_ok = 1;
+      if (cap && n < cap && ea_ok && (ner || (size >= 1024 && lsa >= lo))) { n++; extern unsigned long long ps3_qpc_us(void);
           fprintf(stderr, "[GETLOG] t=%llu spu=0x%X pc=0x%05X task=%d img=%d ea=0x%08X -> LS 0x%05X size=0x%X first=%02X%02X%02X%02X %02X%02X%02X%02X\n",
                   ps3_qpc_us(), ctx->spu_id, (unsigned)(ctx->pc & SPU_LS_MASK), (int)ctx->resident_task, ctx->image_id, ea, lsa, size, ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[6], ls[7]); } }
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base) {
             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
+                /* The whole claim goes, not just the overwritten part: lifted
+                 * code below the transfer calls lifted code inside it DIRECTLY
+                 * (no residency check), so a truncated claim would run the
+                 * lifted default overlay over whatever was streamed there. */
                 ctx->resident_code[slot].image_id = 0;
                 spu_dcache_residency_changed(ctx);
             } else if (ctx->resident_code[slot].verify_state) {
@@ -2381,6 +2585,30 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         }
     }
     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+    /* Content re-claim. Tasks that share an SPU overwrite each other's LS (the
+     * FMOD MultiStream task streams its 0x4000 buffers over FMOD's ph1 code at
+     * 0x20080+), and SPURS brings the code back from a context-save area, not
+     * from the region's own source EA -- so no EA-keyed claim ever sees it, and
+     * the restored code ran interpreted (LS 0x22400-0x23C00, ~10-20M steps/s).
+     * After a GET from elsewhere into a non-relocatable region's home range,
+     * claim the whole span again iff every byte of it equals the lifted bytes:
+     * that is exactly the condition under which the lifted code is correct, and
+     * the whole span (not a part) because lifted code calls within it directly.
+     * MM_OVL_RECLAIM=0 off. */
+    { static int s_rc = -1; if (s_rc < 0) { const char* e = getenv("MM_OVL_RECLAIM"); s_rc = !(e && e[0] == '0'); }
+      if (s_rc && s_ovl_srccheck > 0) {
+        for (int i = 0; i < nsrc; i++) {
+            const spu_ovl_src* o = &s_ovl_src[i];
+            const uint32_t home = o->home_lsa;
+            if (!s_ovl_pristine[i] || !home || home + o->span > SPU_LS_SIZE) continue;
+            if (lsa >= home + o->span || lsa + size <= home) continue;
+            if (ea >= o->src_ea && ea - o->src_ea < o->span) continue;   /* own source: normal path */
+            if (spu_ovl_try_reclaim(ctx, i)) {
+                static unsigned long n_rc; if (n_rc++ < 16)
+                    fprintf(stderr, "[spu-ovl] spu=0x%X re-claim image %d at LS 0x%05X span 0x%X: bytes restored by GET ea=0x%08X -> LS 0x%05X size=0x%X\n",
+                            ctx->spu_id, o->image_id, home, o->span, ea, lsa, size); }
+        }
+      } }
     /* Invalidate destination code/residency above even for an unrelated EA.
      * Acquire count before the signature flag: if this snapshot contains a
      * signature, its earlier flag publication is visible. A racing future
@@ -2400,7 +2628,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 if (ls[k] != o->sig[0] || memcmp(ls + k, o->sig, 16) != 0) continue;
                 const uint32_t at = lsa + k;
                 if (at + o->span > SPU_LS_SIZE) break;
-                for (unsigned slot = 0; slot < 4; ++slot) {
+                for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != at &&
                         ctx->resident_code[slot].image_id != o->image_id)
                         continue;
@@ -2418,14 +2646,33 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
         }
     }
+    /* A GET from an EA-keyed region's own source that brings bytes other than
+     * the lifted ones (see spu_overlay_snapshot_sources): every claim it
+     * touches ends, and it neither extends nor creates one. */
+    if (s_ovl_srccheck > 0 && size >= 16) {
+        for (int i = 0; i < nsrc; i++) {
+            const spu_ovl_src* o = &s_ovl_src[i];
+            if (!s_ovl_pristine[i] || ea < o->src_ea || ea - o->src_ea >= o->span) continue;
+            if (spu_ovl_src_intact(i, ea - o->src_ea, ls, size, lsa)) break;
+            for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot) {
+                if (!ctx->resident_code[slot].image_id) continue;
+                const uint32_t base = ctx->resident_code[slot].lsa, end = base + ctx->resident_code[slot].size;
+                if (lsa < end && lsa + size > base) { ctx->resident_code[slot].image_id = 0; spu_dcache_residency_changed(ctx); }
+            }
+            return;
+        }
+    }
     /* A GET continuing a partially-resident EA-keyed region (its EA and LS
-     * both follow on from what the slot already covers) extends the claim. */
-    for (unsigned slot = 0; slot < 4; ++slot) {
+     * both follow on from what the slot already covers) extends the claim.
+     * Relocatable EA-keyed regions too: the test is relative to the slot's own
+     * placement, so it holds at any load address (the SPUJobs PRX text arrives
+     * as four consecutive GETs, at LS 0x4C00 or 0x7400). */
+    for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         const int si = ctx->resident_code[slot].source_index;
         if (si < 0 || si >= nsrc) continue;
         const spu_ovl_src* o = &s_ovl_src[si];
-        if (o->has_sig || !o->span || o->canon || o->src_ea != ctx->resident_code[slot].source_ea) continue;
+        if (o->has_sig || !o->span || o->src_ea != ctx->resident_code[slot].source_ea) continue;
         const uint32_t cur = ctx->resident_code[slot].size;
         if (cur >= o->span || ea < o->src_ea) continue;
         const uint32_t rel = ea - o->src_ea;
@@ -2442,7 +2689,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 if (lsa + o->span > SPU_LS_SIZE) return;
                 /* Verified code was lifted for one load address. */
                 if (o->code && lsa != o->load_lsa) continue;
-                for (unsigned slot = 0; slot < 4; ++slot) {
+                int evicted = 0;
+            claim_retry:
+                for (unsigned slot = 0; slot < SPU_RESIDENT_SLOTS; ++slot) {
                     /* A relocatable image takes over its own previous placement's slot: each load
                      * lands somewhere new, and stale copies would fill the slots. */
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
@@ -2464,8 +2713,22 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_index = i;
                     ctx->resident_code[slot].canon = o->canon;
                     spu_dcache_residency_changed(ctx);
+                    if (!o->canon && !o->has_sig && !s_ovl_src[i].home_lsa && s_ovl_pristine[i]) {
+                        s_ovl_src[i].home_lsa = lsa;
+                        fprintf(stderr, "[spu-ovl] image %d src 0x%08X home LS 0x%05X\n", o->image_id, o->src_ea, lsa); }
+                    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
+                        fprintf(stderr, "[spu-ovl] spu=0x%X claim image %d slot %u: ea=0x%08X -> LS 0x%05X size=0x%X (span 0x%X)\n",
+                                ctx->spu_id, o->image_id, slot, ea, lsa, ctx->resident_code[slot].size, o->span); }
                     return;
                 }
+                /* All slots hold other placements: the new load is the code that
+                 * will run next, so drop a rotating victim's claim (that code just
+                 * runs interpreted until its next load) instead of this one. */
+                if (!evicted) { static SPU_THREAD_LOCAL unsigned rr; const unsigned v = rr++ % SPU_RESIDENT_SLOTS;
+                    { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                        fprintf(stderr, "[spu-ovl] resident code slots full: image %d evicts image %d at LS 0x%05X\n",
+                                o->image_id, ctx->resident_code[v].image_id, ctx->resident_code[v].lsa); }
+                    ctx->resident_code[v].image_id = 0; spu_dcache_residency_changed(ctx); evicted = 1; goto claim_retry; }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
                 return;
             }
@@ -2885,7 +3148,7 @@ static int spu_smc_microstep(spu_context* ctx)
          * stopped states and diagnostic exits keep their existing behavior. */
         if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
             (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
-            spu_lifted_lookup(ctx, ctx->pc)) {
+            spu_rejoin_lookup(ctx, ctx->pc)) {
             g_spu_trampoline_fn = spu_indirect_branch;
             return 1;
         }
@@ -2978,7 +3241,15 @@ void spu_indirect_branch(spu_context* ctx)
         int lifted = spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->image_id) ||
             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
             (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
-        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
+        /* "No policy module in this local store" -- not "none LIFTED at 0xA70":
+         * a resident policy overlay whose 0xA70 is deliberately left to the
+         * interpreter (MM_PM1_SKIP) is still the real taskset policy. Treating
+         * it as standalone HLE'd Monster Madness's FMOD task syscall as an
+         * exit when the call came from lifted code (the interpreter, which
+         * only HLEs image 22 / policy mode, ran the real PM): every SPURS SPU
+         * thread stopped at 0xA70 and the game waited forever. */
+        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted &&
+                         !ctx->resident_ovl;
         /* MM_PM_REAL_SYSCALL=1: when Sony's taskset policy module is lifted and
          * resident (resident_ovl has 0xA70), run it instead of the HLE syscall.
          * Interpreted task code reaches the real PM code; lifted task code came
@@ -3121,6 +3392,7 @@ void spu_indirect_branch(spu_context* ctx)
                   ctx->resident_task == s_tl ? "enter" : "leave", (unsigned)(ctx->pc & SPU_LS_MASK)); } }
     /* Use the same ownership order as the interpreter's rejoin probe. */
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    if (!fn && spu_ovl_reclaim_at(ctx, ctx->pc & SPU_LS_MASK)) fn = spu_lifted_lookup(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -3228,10 +3500,23 @@ void spu_indirect_branch(spu_context* ctx)
                * code that calls unlifted code (libsre PM -> kernel 0x2FA20) waits
                * in spu_drain_call(ctx, RET); spu_interp_run interpreted straight
                * past RET, so the lifted caller later re-ran its own tail. */
+              /* Now the default (MM_IU_UNTIL=0 = old run-past-RET behaviour),
+               * matching the microstep hand-off in spu_smc_microstep. */
               static int s_until = -1;
-              if (s_until < 0) { const char* e = getenv("MM_IU_UNTIL"); s_until = (e && e[0] == '1'); }
-              if (s_until && ctx->drain_ret_pc) spu_interp_run_until(ctx, p, ctx->drain_ret_pc);
-              else spu_interp_run(ctx, p);
+              if (s_until < 0) { const char* e = getenv("MM_IU_UNTIL"); s_until = !(e && e[0] == '0'); }
+              const uint32_t return_pc = (s_until && ctx->host_depth) ? ctx->drain_ret_pc : 0;
+              spu_interp_run_until(ctx, p, return_pc);
+              /* The interpreter hands back as soon as it reaches lifted code.
+               * That is a transfer, not the end of the job: re-arm the
+               * trampoline so the lifted target runs. Returning with it empty
+               * let the top-level driver end the SPU run there -- Monster
+               * Madness's FMOD task left lifted code at LS 0x2035C for
+               * unlifted 0x20424, rejoined lifted code on the way back, and
+               * its SPU thread stopped (FAULT); the game waited forever. */
+              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+                  (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
+                  spu_rejoin_lookup(ctx, ctx->pc))
+                  g_spu_trampoline_fn = spu_indirect_branch;
               return;
           } }
         spu_halt(ctx);
